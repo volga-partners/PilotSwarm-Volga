@@ -4822,6 +4822,7 @@ orchList.key(["enter"], async () => {
     const idx = orchList.selected;
     if (idx >= 0 && idx < orchIdOrder.length) {
         await switchToOrchestration(orchIdOrder[idx]);
+        focusInput();
         screen.render();
     }
 });
