@@ -49,7 +49,7 @@ function setStatus(ctx: any, status: PilotSwarmSessionStatus, extra?: Record<str
  *
  * @internal
  */
-export const CURRENT_ORCHESTRATION_VERSION = "1.0.25";
+export const CURRENT_ORCHESTRATION_VERSION = "1.0.24";
 
 /**
  * Long-lived durable session orchestration.
@@ -67,7 +67,7 @@ export const CURRENT_ORCHESTRATION_VERSION = "1.0.25";
  *
  * @internal
  */
-export function* durableSessionOrchestration_1_0_25(
+export function* durableSessionOrchestration_1_0_24(
     ctx: any,
     input: OrchestrationInput,
 ): Generator<any, string, any> {
@@ -452,7 +452,8 @@ export function* durableSessionOrchestration_1_0_25(
                                 };
                                 yield* writeCommandResponse(resp);
                                 publishStatus("idle");
-                                continue;
+                                yield versionedContinueAsNew(continueInput());
+                                return "";
                             }
                             case "list_models": {
                                 publishStatus("idle", { cmdProcessing: cmdMsg.id });
