@@ -120,6 +120,20 @@ Client                        PostgreSQL                     Worker Pods
 | [Worker](packages/sdk/examples/worker.js) | Headless worker for K8s | `npm run worker` |
 | [Tests](packages/sdk/test/sdk.test.js) | Automated test suite | `npm test` |
 
+## MCP Server
+
+PilotSwarm includes an MCP ([Model Context Protocol](https://modelcontextprotocol.io/)) server that exposes sessions, agents, facts, and models to any MCP-compatible client — Claude Desktop, Copilot CLI, Cursor, VS Code, ChatGPT, and more.
+
+```bash
+# Start with stdio (for local IDEs)
+npx pilotswarm-mcp --store "$DATABASE_URL" --model-providers .model_providers.json
+
+# Start with HTTP (for remote access)
+PILOTSWARM_MCP_KEY=secret npx pilotswarm-mcp --transport http --port 3100 --store "$DATABASE_URL"
+```
+
+See [MCP Server docs](packages/mcp-server/README.md) for client configuration examples.
+
 ## Documentation
 
 Start with the documentation hub:
