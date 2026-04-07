@@ -13,7 +13,7 @@ A complete source-level map of the PilotSwarm codebase. Complements `architectur
 | **Runtime** | Node.js 24+ |
 | **Language** | TypeScript (src), plain JS (tests, examples, CLI) |
 | **Build** | `tsc` → `dist/`, ES2022 target, NodeNext resolution |
-| **Key deps** | `@github/copilot-sdk` v0.1.32, `duroxide` v0.1.14, `pg` v8.18, `@azure/storage-blob` v12.31 |
+| **Key deps** | `@github/copilot-sdk` v0.1.32, `duroxide` v0.1.18, `pg` v8.18, `@azure/storage-blob` v12.31 |
 
 ### Build & Run
 
@@ -57,7 +57,9 @@ npm run db:reset       # Drop duroxide + CMS schemas
 | File | Responsibility |
 |------|---------------|
 | `bin/tui.js` | CLI entry point, argument parsing, env loading |
-| `cli/tui.js` | Main TUI (2,000+ lines), neo-blessed UI, session management |
+| `src/index.js` | Terminal host bootstrap, render lifecycle, controller wiring |
+| `src/app.js` | Input handling, shortcut routing, mouse/prompt behavior |
+| `src/platform.js` | Terminal platform adapter and panel rendering |
 
 ### Examples
 
@@ -66,7 +68,6 @@ npm run db:reset       # Drop duroxide + CMS schemas
 | `examples/chat.js` | Interactive console chat with full orchestration |
 | `examples/worker.js` | Headless K8s worker (standalone deployment) |
 | `examples/test-models.js` | Batch model verification |
-| `examples/tui.js` | Deprecated (superseded by `cli/tui.js`) |
 
 ### Tests
 
@@ -420,7 +421,7 @@ Azure Blob Storage container: `copilot-sessions`
 
 ## 10. Model Provider System
 
-The checked-in `.model_providers.json` configures multi-provider LLM access. Providers whose credentials are absent from the environment are filtered out at runtime, so the visible selector catalog is environment-dependent.
+The checked-in `.model_providers.example.json` documents the shared multi-provider LLM catalog shape. Real runtime resolution uses the local `.model_providers.json`, which is typically copied from that template and kept out of git so user-specific endpoints can stay private. Providers whose credentials are absent from the environment are filtered out at runtime, so the visible selector catalog is environment-dependent.
 
 ```json
 {
@@ -513,7 +514,11 @@ Skills are loaded via `loadSkills()` and injected into CopilotSession system mes
 
 ## 12. TUI Architecture
 
-The TUI (`cli/tui.js`, 2,000+ lines) provides a terminal interface built with `neo-blessed`.
+The TUI is a shared three-layer stack:
+
+- `packages/ui-core/` for state, reducers, selectors, history shaping, and view models
+- `packages/ui-react/` for shared React components/layout
+- `packages/cli/` for the terminal host
 
 ### Layout
 
@@ -642,6 +647,7 @@ ENTRYPOINT ["node", "examples/worker.js"]
 | `getDefaultModel()` | Read the configured default model |
 | `cancelSession(id)` | Cancel orchestration (leave CMS intact) |
 | `sendMessage(id, prompt)` / `sendAnswer(id, answer)` / `sendCommand(id, cmd)` | Drive a session administratively |
+| `getOrchestrationStats(id)` | Fetch duroxide orchestration runtime stats (history size, queue depth, KV usage) |
 | `getLatestResponse(id)` / `getCommandResponse(id, cmdId)` | Read KV-backed orchestration outputs |
 | `dumpSession(id)` | Export session transcript |
 

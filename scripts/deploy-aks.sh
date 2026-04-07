@@ -24,6 +24,29 @@ ACR_NAME="${ACR_NAME:-toygresaksacr}"
 IMAGE_NAME="${IMAGE_NAME:-copilot-runtime-worker}"
 NAMESPACE="${NAMESPACE:-copilot-runtime}"
 
+wait_for_worker_scale_down() {
+    local timeout_seconds="${1:-180}"
+    local deployment="copilot-runtime-worker"
+    local selector="app.kubernetes.io/component=worker"
+    local deadline=$((SECONDS + timeout_seconds))
+
+    kubectl rollout status deployment/"$deployment" -n "$NAMESPACE" --timeout="${timeout_seconds}s" >/dev/null 2>&1 || true
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        local remaining_pods
+        remaining_pods="$(kubectl get pods -n "$NAMESPACE" -l "$selector" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+        if [ "${remaining_pods:-0}" = "0" ]; then
+            echo "   ✅ Workers fully terminated"
+            return 0
+        fi
+        sleep 2
+    done
+
+    echo "   ❌ Timed out waiting for workers to terminate before DB reset."
+    kubectl get pods -n "$NAMESPACE" -l "$selector" || true
+    return 1
+}
+
 # Parse flags
 SKIP_BUILD=false
 SKIP_RESET=false
@@ -87,6 +110,16 @@ kubectl create secret generic copilot-runtime-secrets \
     ${ANTHROPIC_API_KEY:+--from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"} \
     --dry-run=client -o yaml | kubectl apply -f -
 
+echo "🔐 Refreshing ACR pull secret..."
+ACR_SERVER="${ACR_NAME}.azurecr.io"
+ACR_REFRESH_TOKEN="$(az acr login --name "$ACR_NAME" --expose-token --output tsv --query accessToken)"
+kubectl create secret docker-registry acr-pull \
+    -n "$NAMESPACE" \
+    --docker-server="$ACR_SERVER" \
+    --docker-username="00000000-0000-0000-0000-000000000000" \
+    --docker-password="$ACR_REFRESH_TOKEN" \
+    --dry-run=client -o yaml | kubectl apply -f -
+
 # ─── Step 0: Run local integration tests ─────────────────────────
 
 if [ "$SKIP_TESTS" = false ]; then
@@ -113,7 +146,7 @@ if [ "$SKIP_RESET" = false ]; then
     # Scale down workers first so nothing picks up work
     echo "   Scaling workers to 0..."
     kubectl scale deployment copilot-runtime-worker -n "$NAMESPACE" --replicas=0 2>/dev/null || true
-    sleep 3
+    wait_for_worker_scale_down 180
 
     # Reset both duroxide and CMS schemas
     echo "   Resetting database (duroxide + CMS schemas)..."

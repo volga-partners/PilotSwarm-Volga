@@ -18,8 +18,9 @@ Build layered CLI/TUI apps on top of the shipped PilotSwarm interface.
 
 ```text
 my-app/
+├── .gitignore
 ├── .env.example
-├── .model_providers.json
+├── .model_providers.example.json
 ├── package.json
 ├── plugin/
 │   ├── plugin.json
@@ -44,12 +45,14 @@ my-app/
 6. Put reusable domain knowledge in `plugin/skills/*/SKILL.md`.
 7. Put runtime tool handlers in `worker-module.js`.
 8. Add `session-policy.json` if the user does not want generic sessions. The policy is enforced in both local and remote modes — the TUI reads it from the plugin directory even when there are no embedded workers.
-9. Build `.env.example` and a gitignored `.env` from the PilotSwarm sample env shape when the user wants runnable scaffolding.
-10. Add a checked-in `.model_providers.json` when the scaffold needs a custom model catalog.
+9. Build `.env.example` and a gitignored `.env` by copying/adapting the PilotSwarm repo's example env shape when the user wants runnable scaffolding.
+10. Build `.model_providers.example.json` and a gitignored `.model_providers.json` by copying/adapting the PilotSwarm repo's example model-catalog shape when the scaffold needs a custom model catalog.
 11. Add checked-in scripts for launch and database cleanup (both local and remote modes).
 12. Make generated scripts executable and verify the executable bit.
 13. Add a README with local run instructions.
 14. When agents need durable structured memory or shared coordination state, use PilotSwarm's built-in facts tools (`store_fact`, `read_facts`, `delete_fact`) as the primary memory layer. They are available to every agent session by default, including system agents, so do not build a separate fact table unless the app truly requires it.
+15. When agents need recurring autonomous work (monitoring, polling, periodic cleanup), use the durable `cron` tool: `cron(seconds=N, reason="...")` to start, `cron(action="cancel")` to stop. Cron schedules survive process restarts and worker failovers. Prefer cron over `wait` loops for periodic tasks.
+16. Agents can read their context usage (current tokens, token limit) from the session status. The TUI displays this in the status bar. Use this for agents that need to manage context window budgets or trigger compaction.
 
 ## Guided Intake Questions
 
@@ -70,12 +73,13 @@ Do not guess these answers when the user has not provided them. Offer the standa
 ## Env File Guidance
 
 - Treat `DATABASE_URL` as the canonical PostgreSQL connection input.
-- If the app needs a non-default model catalog, check in `.model_providers.json` and keep provider keys in `.env` / `.env.remote`.
+- If the app needs a non-default model catalog, check in `.model_providers.example.json`, create the real `.model_providers.json` locally from it, and keep provider keys in `.env` / `.env.remote`.
 - For local-first scaffolds, assume GitHub Copilot is the only model provider unless the user explicitly asks for another provider.
 - For local-first scaffolds, do not include `LLM_PROVIDER_TYPE`, `LLM_ENDPOINT`, `LLM_API_KEY`, or `LLM_API_VERSION` by default.
 - Do not generate redundant `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, or `PGDATABASE` entries unless the user explicitly needs them.
 - Prefer a checked-in `.env.example` plus a local gitignored `.env`.
-- Do not invent a `.model_providers.example.json`; the real `.model_providers.json` is the source of truth when a custom catalog is needed.
+- Prefer a checked-in `.model_providers.example.json` plus a local gitignored `.model_providers.json`.
+- Add both `.env` and `.model_providers.json` to `.gitignore` in runnable scaffolds.
 - Align the variable set with the chosen topology rather than blindly copying every sample env field.
 - For local-first scaffolds, the default env surface should usually be:
   - `DATABASE_URL`
