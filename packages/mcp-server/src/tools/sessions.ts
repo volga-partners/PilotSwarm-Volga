@@ -1,6 +1,12 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import type { PilotSwarmSession } from "pilotswarm-sdk";
 import type { ServerContext } from "../context.js";
+
+// Cache session objects so send_and_wait can reuse them instead of
+// calling resumeSession() which incorrectly assumes the orchestration
+// is already running. Mirrors the TUI pattern of holding onto sess.
+const sessionCache = new Map<string, PilotSwarmSession>();
 
 export function registerSessionTools(server: McpServer, ctx: ServerContext) {
     // 1. create_session — Create a new PilotSwarm session
@@ -13,7 +19,7 @@ export function registerSessionTools(server: McpServer, ctx: ServerContext) {
                 model: z.string().optional().describe("Model to use for the session"),
                 agent: z.string().optional().describe("Agent name to bind the session to"),
                 system_message: z.string().optional().describe("Custom system message for the session"),
-                title: z.string().optional().describe("Title for the session"),
+                title: z.string().optional().describe("Optional title — if omitted, PilotSwarm auto-generates one from the conversation after the first turn"),
             },
         },
         async ({ model, agent, system_message, title }) => {
@@ -34,6 +40,18 @@ export function registerSessionTools(server: McpServer, ctx: ServerContext) {
                         model,
                         systemMessage: system_message,
                     });
+                }
+
+                // Cache the session object for later use by send_and_wait
+                sessionCache.set(session.sessionId, session);
+
+                // Persist title via management client (createSession doesn't accept title)
+                if (title) {
+                    try {
+                        await ctx.mgmt.renameSession(session.sessionId, title);
+                    } catch {
+                        // Best-effort — session still created
+                    }
                 }
 
                 return {
@@ -103,7 +121,11 @@ export function registerSessionTools(server: McpServer, ctx: ServerContext) {
         async ({ session_id, message, timeout_ms }) => {
             try {
                 const timeout = timeout_ms ?? 120_000;
-                const session = await ctx.client.resumeSession(session_id);
+                // Use cached session object if available (preserves correct
+                // orchestration creation path). Fall back to resumeSession()
+                // for sessions created outside the MCP server.
+                const session = sessionCache.get(session_id)
+                    ?? await ctx.client.resumeSession(session_id);
                 const response = await session.sendAndWait(message, timeout);
                 return {
                     content: [
@@ -176,6 +198,7 @@ export function registerSessionTools(server: McpServer, ctx: ServerContext) {
         async ({ session_id, reason }) => {
             try {
                 await ctx.mgmt.cancelSession(session_id, reason);
+                sessionCache.delete(session_id);
                 return {
                     content: [
                         { type: "text" as const, text: JSON.stringify({ aborted: true }) },
@@ -220,7 +243,115 @@ export function registerSessionTools(server: McpServer, ctx: ServerContext) {
         },
     );
 
-    // 7. delete_session — Delete a session
+    // 7. list_sessions — List all sessions with status
+    server.registerTool(
+        "list_sessions",
+        {
+            title: "List Sessions",
+            description:
+                "List all PilotSwarm sessions with their current status, model, agent info, and parent/child relationships. " +
+                "Use status_filter to narrow results (e.g. 'running', 'idle', 'waiting', 'completed', 'failed').",
+            inputSchema: {
+                status_filter: z
+                    .string()
+                    .optional()
+                    .describe("Filter by status (running, idle, waiting, completed, failed, input_required)"),
+                include_system: z
+                    .boolean()
+                    .optional()
+                    .describe("Include system sessions like Sweeper Agent (default false)"),
+            },
+        },
+        async ({ status_filter, include_system }) => {
+            try {
+                let sessions = await ctx.mgmt.listSessions();
+
+                if (!include_system) {
+                    sessions = sessions.filter((s: any) => !s.isSystem);
+                }
+                if (status_filter) {
+                    const f = status_filter.toLowerCase();
+                    sessions = sessions.filter((s: any) => s.status?.toLowerCase() === f);
+                }
+
+                const data = sessions.map((s: any) => ({
+                    session_id: s.sessionId,
+                    title: s.title ?? null,
+                    status: s.status,
+                    orchestration_status: s.orchestrationStatus ?? null,
+                    model: s.model ?? "default",
+                    agent_id: s.agentId ?? null,
+                    is_system: s.isSystem ?? false,
+                    parent_session_id: s.parentSessionId ?? null,
+                    iterations: s.iterations ?? 0,
+                    wait_reason: s.waitReason ?? null,
+                    error: s.error ?? null,
+                    pending_question: s.pendingQuestion ?? null,
+                    created_at: s.createdAt,
+                    updated_at: s.updatedAt ?? null,
+                }));
+
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: JSON.stringify(
+                                { count: data.length, sessions: data },
+                                null,
+                                2,
+                            ),
+                        },
+                    ],
+                };
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                return {
+                    content: [{ type: "text" as const, text: `Error: ${msg}` }],
+                    isError: true,
+                };
+            }
+        },
+    );
+
+    // 8. get_session_detail — Get detailed info for a single session
+    server.registerTool(
+        "get_session_detail",
+        {
+            title: "Get Session Detail",
+            description:
+                "Get detailed information for a specific PilotSwarm session including status, context usage, cron state, and pending questions",
+            inputSchema: {
+                session_id: z.string().describe("The session ID to inspect"),
+            },
+        },
+        async ({ session_id }) => {
+            try {
+                const session = await ctx.mgmt.getSession(session_id);
+                if (!session) {
+                    return {
+                        content: [{ type: "text" as const, text: `Error: session ${session_id} not found` }],
+                        isError: true,
+                    };
+                }
+                return {
+                    content: [
+                        {
+                            type: "text" as const,
+                            text: JSON.stringify(session, null, 2),
+                        },
+                    ],
+                };
+            } catch (err: unknown) {
+                const msg = err instanceof Error ? err.message : String(err);
+                return {
+                    content: [{ type: "text" as const, text: `Error: ${msg}` }],
+                    isError: true,
+                };
+            }
+        },
+    );
+
+    // 9. delete_session — Delete a session
     server.registerTool(
         "delete_session",
         {
@@ -233,6 +364,7 @@ export function registerSessionTools(server: McpServer, ctx: ServerContext) {
         async ({ session_id }) => {
             try {
                 await ctx.mgmt.deleteSession(session_id);
+                sessionCache.delete(session_id);
                 return {
                     content: [
                         { type: "text" as const, text: JSON.stringify({ deleted: true }) },
