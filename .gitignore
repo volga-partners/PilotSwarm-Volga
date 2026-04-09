@@ -16,3 +16,5 @@ TODO.md
 .squad-workstream
 .portal.pids
 scripts/tmp/
+
+.env.local

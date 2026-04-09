@@ -18,7 +18,11 @@ import type {
     SessionResponsePayload,
 } from "./types.js";
 import type { SessionCatalogProvider, SessionEvent } from "./cms.js";
-import { PgSessionCatalogProvider } from "./cms.js";
+import {
+    buildPgConnectionConfig,
+    PgSessionCatalogProvider,
+    SESSION_EVENTS_NOTIFY_CHANNEL,
+} from "./cms.js";
 import type { FactStore } from "./facts-store.js";
 import { createFactStoreForUrl } from "./facts-store.js";
 
@@ -535,6 +539,16 @@ export class PilotSwarmClient {
         return this._catalog;
     }
 
+    /** @internal */
+    _getStoreConnectionConfig() {
+        return buildPgConnectionConfig(this.config.store);
+    }
+
+    /** @internal */
+    _supportsEventNotifications(): boolean {
+        return this.config.store.startsWith("postgres://") || this.config.store.startsWith("postgresql://");
+    }
+
     /** @internal — exposed for PilotSwarmSession.wait() */
     async _waitForTurnResult_external(
         orchestrationId: string,
@@ -830,9 +844,9 @@ export class PilotSwarmClient {
  * Mirrors CopilotSession API, routes through duroxide orchestration.
  *
  * Event delivery:
- *   on(eventType, handler) — polls CMS session_events table for new events.
+ *   on(eventType, handler) — listens for CMS session_events notifications and fetches new events.
  *   on(handler)            — catch-all, receives every event type.
- *   Returns unsubscribe function. Polling starts on first subscription.
+ *   Returns unsubscribe function. Event delivery starts on first subscription.
  */
 export type SessionEventHandler = (event: SessionEvent) => void;
 
@@ -846,8 +860,11 @@ export class PilotSwarmSession {
     private handlers = new Map<string | null, Set<SessionEventHandler>>();
     private lastSeenSeq = 0;
     private pollTimer: ReturnType<typeof setInterval> | null = null;
+    private listenerClient: any = null;
+    private listenerSetupPromise: Promise<void> | null = null;
     private polling = false;
     private static POLL_INTERVAL = 500; // ms
+    private static FALLBACK_POLL_INTERVAL = 30_000; // ms
 
     /** @internal */
     constructor(sessionId: string, client: PilotSwarmClient, onUserInput?: UserInputHandler) {
@@ -894,7 +911,7 @@ export class PilotSwarmSession {
      *   on(eventType, handler) — typed subscription (e.g. "assistant.message")
      *   on(handler)            — catch-all subscription
      *
-     * Returns an unsubscribe function. Polling starts automatically.
+     * Returns an unsubscribe function. Event delivery starts automatically.
      */
     on(eventType: string, handler: SessionEventHandler): () => void;
     on(handler: SessionEventHandler): () => void;
@@ -915,7 +932,7 @@ export class PilotSwarmSession {
         }
         this.handlers.get(key)!.add(fn);
 
-        // Start polling if not already running
+        // Start event delivery if not already running
         this._startPolling();
 
         return () => {
@@ -924,7 +941,7 @@ export class PilotSwarmSession {
                 set.delete(fn);
                 if (set.size === 0) this.handlers.delete(key);
             }
-            // Stop polling if no handlers left
+            // Stop event delivery if no handlers left
             if (this.handlers.size === 0) {
                 this._stopPolling();
             }
@@ -970,9 +987,21 @@ export class PilotSwarmSession {
 
     private _startPolling(): void {
         if (this.pollTimer) return;
-        this.pollTimer = setInterval(() => this._poll(), PilotSwarmSession.POLL_INTERVAL);
-        // Fire immediately too
-        this._poll();
+
+        if (!this.client._supportsEventNotifications()) {
+            this.pollTimer = setInterval(() => this._poll(), PilotSwarmSession.POLL_INTERVAL);
+            void this._poll();
+            return;
+        }
+
+        this.pollTimer = setInterval(() => {
+            if (!this.listenerClient && !this.listenerSetupPromise) {
+                void this._ensureListener();
+            }
+            void this._poll();
+        }, PilotSwarmSession.FALLBACK_POLL_INTERVAL);
+        void this._ensureListener();
+        void this._poll();
     }
 
     private _stopPolling(): void {
@@ -980,6 +1009,7 @@ export class PilotSwarmSession {
             clearInterval(this.pollTimer);
             this.pollTimer = null;
         }
+        void this._teardownListener();
     }
 
     private async _poll(): Promise<void> {
@@ -1001,6 +1031,69 @@ export class PilotSwarmSession {
         } finally {
             this.polling = false;
         }
+    }
+
+    private async _ensureListener(): Promise<void> {
+        if (!this.client._supportsEventNotifications()) return;
+        if (this.listenerClient) return;
+        if (this.listenerSetupPromise) return this.listenerSetupPromise;
+
+        this.listenerSetupPromise = (async () => {
+            const { default: pg } = await import("pg");
+            const listener = new pg.Client(this.client._getStoreConnectionConfig());
+
+            const handleListenerReset = () => {
+                if (this.listenerClient === listener) {
+                    this.listenerClient = null;
+                }
+                if (this.listenerSetupPromise) {
+                    this.listenerSetupPromise = null;
+                }
+            };
+
+            listener.on("error", () => {
+                handleListenerReset();
+                try { listener.end(); } catch {}
+            });
+            listener.on("end", handleListenerReset);
+            listener.on("notification", (msg: any) => {
+                if (msg.channel !== SESSION_EVENTS_NOTIFY_CHANNEL) return;
+                try {
+                    const payload = JSON.parse(msg.payload ?? "{}");
+                    if (payload.sessionId !== this.sessionId) return;
+                } catch {
+                    return;
+                }
+                void this._poll();
+            });
+
+            try {
+                await listener.connect();
+                await listener.query(`LISTEN ${SESSION_EVENTS_NOTIFY_CHANNEL}`);
+                this.listenerClient = listener;
+            } catch (err) {
+                handleListenerReset();
+                try { await listener.end(); } catch {}
+                throw err;
+            } finally {
+                this.listenerSetupPromise = null;
+            }
+        })().catch(() => {});
+
+        return this.listenerSetupPromise;
+    }
+
+    private async _teardownListener(): Promise<void> {
+        const listener = this.listenerClient;
+        this.listenerClient = null;
+        this.listenerSetupPromise = null;
+        if (!listener) return;
+        try {
+            await listener.query(`UNLISTEN ${SESSION_EVENTS_NOTIFY_CHANNEL}`);
+        } catch {}
+        try {
+            await listener.end();
+        } catch {}
     }
 
     private _dispatch(event: SessionEvent): void {

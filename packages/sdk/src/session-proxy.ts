@@ -14,6 +14,7 @@ import {
     shouldRunPromptGuardrailDetector,
 } from "./prompt-guardrails.js";
 import os from "node:os";
+import { LangFuseTracer } from "./use-trace.js";
 
 // ─── SessionProxy ────────────────────────────────────────────────
 // The orchestration's view of a specific ManagedSession.
@@ -167,6 +168,8 @@ export function registerActivities(
     userAgents?: Array<{ name: string; description?: string; prompt: string; tools?: string[] | null; namespace?: string; id?: string; title?: string; initialPrompt?: string; splash?: string; parent?: string; promptLayerKind?: "app-agent" | "app-system-agent" | "pilotswarm-system-agent" }>,
     /** Fact store instance for the loadKnowledgeIndex activity. */
     factStore?: import("./facts-store.js").FactStore | null,
+   langFuseTracer?: LangFuseTracer,
+
 ) {
     const detectPromptSource = (prompt: string, bootstrap?: boolean): import("./types.js").PromptSource => {
         if (bootstrap) return "system_generated";
@@ -261,9 +264,32 @@ export function registerActivities(
                 clearInterval(cancelPoll);
             }
         }, 2_000);
-
         try {
             const promptSource = detectPromptSource(input.prompt, input.bootstrap);
+
+            let lfGeneration: any = null;
+            const lfToolSpans = new Map<string, any>();
+            const lfTurnStart = Date.now();
+
+            if (langFuseTracer && !input.bootstrap) {
+                try {
+                    const trace = langFuseTracer.getOrCreateTrace(input.sessionId, {
+                        name: `session-${input.sessionId.slice(0, 8)}`,
+                        sessionId: input.sessionId,
+                        metadata: {
+                            agentName: input.config.boundAgentName ?? "default",
+                            promptSource,
+                        },
+                    });
+                    lfGeneration = trace.generation({
+                        name: `turn`,
+                        input: input.prompt,
+                        model: input.config.model ?? "unknown",
+                        startTime: new Date(lfTurnStart),
+                    });
+                } catch {}
+            }
+
             const promptGuardrailConfig = sessionManager.getPromptGuardrails();
             const isTimerPrompt = /^The \d+ second wait is now complete\./i.test(input.prompt);
 
@@ -342,6 +368,7 @@ export function registerActivities(
                 decision: promptGuardrail,
             });
             const enrichedPrompt = `[SYSTEM: Running on host "${hostname}".]\n\n${guardedPrompt}`;
+            const eventBuffer: Array<{ eventType: string; data: unknown }> = [];
 
             // Build onEvent callback: write each non-ephemeral event to CMS as it fires
             const EPHEMERAL_TYPES = new Set([
@@ -349,12 +376,27 @@ export function registerActivities(
                 "assistant.reasoning_delta",
                 "user.message", // Already recorded explicitly above — skip the SDK's duplicate
             ]);
-            const onEvent = catalog
+            const onEvent = (catalog || langFuseTracer)
                 ? (event: { eventType: string; data: unknown }) => {
-                    if (EPHEMERAL_TYPES.has(event.eventType)) return;
-                    catalog.recordEvents(input.sessionId, [event]).catch((err: any) => {
-                        activityCtx.traceInfo(`[runTurn] CMS recordEvent failed: ${err}`);
-                    });
+                    if (catalog && !EPHEMERAL_TYPES.has(event.eventType)) {
+                        eventBuffer.push(event);
+                    }
+                    // LangFuse path
+                    if (langFuseTracer && lfGeneration) {
+                        if (event.eventType === "tool.execution_start") {
+                            const d = event.data as any;
+                            try {
+                                const span = lfGeneration.span({ name: `tool:${d.toolName}`, input: d.toolArgs });
+                                lfToolSpans.set(d.toolName, span);
+                            } catch {}
+                        } else if (event.eventType === "tool.execution_complete") {
+                            const d = event.data as any;
+                            try { lfToolSpans.get(d.toolName)?.end({ output: d.error ?? d.result }); } catch {}
+                            lfToolSpans.delete(d.toolName);
+                        } else if (event.eventType === "assistant.usage") {
+                            (lfGeneration as any)._usage = event.data;
+                        }
+                    }
                 }
                 : undefined;
 
@@ -376,6 +418,18 @@ export function registerActivities(
             });
 
             result.promptGuardrail = promptGuardrail;
+
+            // End LangFuse generation
+            if (lfGeneration) {
+                try {
+                    const u = (lfGeneration as any)._usage;
+                    lfGeneration.end({
+                        output: result.type === "completed" ? (result as any).content : `[${result.type}]`,
+                        usage: u ? { input: u.inputTokens, output: u.outputTokens, unit: "TOKENS" } : undefined,
+                        level: result.type === "error" ? "ERROR" : "DEFAULT",
+                    });
+                } catch {}
+            }
 
             if (
                 promptGuardrail.action === "allow_guarded"
@@ -448,6 +502,14 @@ export function registerActivities(
             // This lets listSessions() read entirely from CMS without
             // hitting duroxide for every session's customStatus.
             if (catalog) {
+                if (eventBuffer.length > 0) {
+                    activityCtx.traceInfo(
+        `[runTurn] flushing buffered CMS events count=${eventBuffer.length} session=${input.sessionId}`
+    );
+                    await catalog.recordEvents(input.sessionId, eventBuffer).catch((err: any) => {
+                        activityCtx.traceInfo(`[runTurn] CMS recordEvents batch failed: ${err}`);
+                    });
+                }
                 const statusMap: Record<string, string> = {
                     completed: "idle", // orchestration decides idle vs completed; default to idle
                     wait: "waiting",
