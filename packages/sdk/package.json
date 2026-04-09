@@ -1,6 +1,6 @@
 {
   "name": "pilotswarm-sdk",
-  "version": "0.1.11",
+  "version": "0.1.14",
   "description": "A durable execution runtime for GitHub Copilot SDK agents. Crash recovery, durable timers, session dehydration, and multi-node scaling — powered by duroxide.",
   "type": "module",
   "main": "./dist/index.js",
@@ -54,11 +54,11 @@
     "url": "https://github.com/affandar/PilotSwarm/issues"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.901.0",
-    "@aws-sdk/s3-request-presigner": "^3.901.0",
+    "@aws-sdk/client-s3": "^3.1025.0",
+    "@aws-sdk/s3-request-presigner": "^3.1025.0",
     "@github/copilot": "^1.0.2",
     "@github/copilot-sdk": "^0.2.0",
-    "duroxide": "^0.1.17",
+    "duroxide": "^0.1.19",
     "pg": "^8.18.0"
   },
   "devDependencies": {

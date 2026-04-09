@@ -1,93 +1,98 @@
 /**
- * Sub-agent test: Spawn named agents by agent_name (sweeper, resourcemgr).
+ * Named agent resolution tests.
  *
- * Verifies that spawn_agent(agent_name=...) resolves the agent definition
- * and creates child sessions with the correct title, agentId, isSystem
- * flag, splash banner, and parent link.
+ * Verifies that:
+ * - user-creatable named agents resolve as creatable
+ * - worker-managed system agents resolve as non-creatable
+ * - system agent metadata is still available for diagnostics/rejection paths
  *
  * Run: npx vitest run test/local/sub-agents/named-agents.test.js
  */
 
-import { describe, it, beforeAll } from "vitest";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { createTestEnv, preflightChecks, useSuiteEnv } from "../../helpers/local-env.js";
-import { withClient } from "../../helpers/local-workers.js";
-import { assertNotNull, assertGreaterOrEqual, assertEqual } from "../../helpers/assertions.js";
-import { createCatalog } from "../../helpers/cms-helpers.js";
+import { describe, expect, it } from "vitest";
+import { registerActivities } from "../../../src/session-proxy.ts";
 
-const TIMEOUT = 180_000;
-const getEnv = useSuiteEnv(import.meta.url);
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const MGMT_PLUGIN_DIR = path.resolve(__dirname, "../../../plugins/mgmt");
+function makeResolveHarness() {
+    const handlers = {};
+    const runtime = {
+        registerActivity(name, handler) {
+            handlers[name] = handler;
+        },
+    };
 
-async function testSpawnNamedAgents(env) {
-    const catalog = await createCatalog(env);
+    const sessionManager = {
+        getModelSummary: () => undefined,
+    };
 
-    try {
-        // Load mgmt agent definitions (sweeper, resourcemgr) without auto-starting them
-        await withClient(env, {
-            worker: { pluginDirs: [MGMT_PLUGIN_DIR] },
-        }, async (client) => {
-            const session = await client.createSession();
+    registerActivities(
+        runtime,
+        sessionManager,
+        null,
+        undefined,
+        null,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        [
+            {
+                name: "sweeper",
+                description: "Worker-managed maintenance agent",
+                prompt: "You are sweeper.",
+                tools: ["scancompletedsessions"],
+                system: true,
+                id: "sweeper",
+                title: "Sweeper Agent",
+                parent: "pilotswarm",
+                namespace: "pilotswarm",
+                promptLayerKind: "pilotswarm-system-agent",
+            },
+        ],
+        null,
+        [],
+        [
+            {
+                name: "alpha",
+                description: "User-creatable test agent",
+                prompt: "You are alpha.",
+                tools: ["bash"],
+                namespace: "testapp",
+                title: "Alpha Agent",
+                promptLayerKind: "app-agent",
+            },
+        ],
+        undefined,
+        "worker-1",
+    );
 
-            // Spawn sweeper by agent_name
-            console.log("  Spawning sweeper by agent_name...");
-            const r1 = await session.sendAndWait(
-                "Spawn the sweeper agent using agent_name=\"sweeper\"",
-                TIMEOUT,
-            );
-            console.log(`  Response: "${r1?.slice(0, 80)}"`);
-
-            // Spawn resourcemgr by agent_name
-            console.log("  Spawning resourcemgr by agent_name...");
-            const r2 = await session.sendAndWait(
-                "Now spawn the resourcemgr agent using agent_name=\"resourcemgr\"",
-                TIMEOUT,
-            );
-            console.log(`  Response: "${r2?.slice(0, 80)}"`);
-
-            // Find children
-            const allSessions = await catalog.listSessions();
-            const children = allSessions.filter(
-                s => s.parentSessionId === session.sessionId,
-            );
-            console.log(`  Children found: ${children.length}`);
-            for (const c of children) {
-                console.log(`    - agentId=${c.agentId}, title="${c.title}", isSystem=${c.isSystem}`);
-            }
-
-            assertGreaterOrEqual(children.length, 2, "Expected both sweeper and resourcemgr children");
-
-            const sweeper = children.find(c => c.agentId === "sweeper");
-            const resourcemgr = children.find(c => c.agentId === "resourcemgr");
-
-            // ── Verify sweeper ──
-            assertNotNull(sweeper, "Sweeper should be spawned with agentId='sweeper'");
-            assertEqual(sweeper.title, "Sweeper Agent", "Sweeper title");
-            assertEqual(sweeper.isSystem, true, "Sweeper should be system");
-            assertEqual(sweeper.parentSessionId, session.sessionId, "Sweeper parent link");
-            assertNotNull(sweeper.splash, "Sweeper should have splash banner");
-
-            // ── Verify resourcemgr ──
-            assertNotNull(resourcemgr, "ResourceMgr should be spawned with agentId='resourcemgr'");
-            assertEqual(resourcemgr.title, "Resource Manager Agent", "ResourceMgr title");
-            assertEqual(resourcemgr.isSystem, true, "ResourceMgr should be system");
-            assertEqual(resourcemgr.parentSessionId, session.sessionId, "ResourceMgr parent link");
-            assertNotNull(resourcemgr.splash, "ResourceMgr should have splash banner");
-
-            console.log(`  ✓ sweeper: title="${sweeper.title}", agentId=${sweeper.agentId}, isSystem=${sweeper.isSystem}`);
-            console.log(`  ✓ resourcemgr: title="${resourcemgr.title}", agentId=${resourcemgr.agentId}, isSystem=${resourcemgr.isSystem}`);
-        });
-    } finally {
-        await catalog.close();
-    }
+    return {
+        resolveAgentConfig: handlers.resolveAgentConfig,
+    };
 }
 
-describe("Sub-Agent: Named Agents", () => {
-    beforeAll(async () => { await preflightChecks(); });
+describe("Sub-Agent: Named agent resolution", () => {
+    it("marks worker-managed system agents as non-creatable", async () => {
+        const { resolveAgentConfig } = makeResolveHarness();
 
-    it("Spawn Named Agents by agent_name", { timeout: TIMEOUT * 2 }, async () => {
-        await testSpawnNamedAgents(getEnv());
+        const agent = await resolveAgentConfig({}, { agentName: "sweeper" });
+
+        expect(agent).not.toBeNull();
+        expect(agent.name).toBe("sweeper");
+        expect(agent.system).toBe(true);
+        expect(agent.creatable).toBe(false);
+        expect(agent.parent).toBe("pilotswarm");
+        expect(agent.title).toBe("Sweeper Agent");
+    });
+
+    it("keeps user agents creatable", async () => {
+        const { resolveAgentConfig } = makeResolveHarness();
+
+        const agent = await resolveAgentConfig({}, { agentName: "alpha" });
+
+        expect(agent).not.toBeNull();
+        expect(agent.name).toBe("alpha");
+        expect(agent.system).toBe(false);
+        expect(agent.creatable).toBe(true);
+        expect(agent.namespace).toBe("testapp");
     });
 });
