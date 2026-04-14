@@ -1,0 +1,23 @@
+{
+  "name": "pilotswarm-portal-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Express + WebSocket API backend for the PilotSwarm web portal.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.1.0",
+    "google-auth-library": "^9.5.0",
+    "jose": "^6.2.2",
+    "pg": "^8.18.0",
+    "ws": "^8.18.2"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
