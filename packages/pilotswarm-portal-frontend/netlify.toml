@@ -1,0 +1,11 @@
+[[redirects]]
+  from = "/api/*"
+  to = "https://api.algovity.ai/api/:splat"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/portal-ws"
+  to = "wss://api.algovity.ai/portal-ws"
+  status = 200
+  force = true
