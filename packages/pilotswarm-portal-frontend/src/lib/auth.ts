@@ -169,10 +169,9 @@ export async function loginWithGoogle(config: AuthConfig["google"]): Promise<voi
     scope: "openid profile email",
     redirect_uri: window.location.origin,
     state,
+    access_type: "offline",
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
-    access_type: "offline",
-    prompt: "consent",
   });
 
   window.location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
@@ -204,6 +203,7 @@ export async function handleOAuthCallback(code: string, state: string): Promise<
         code,
         state,
         codeVerifier,
+        redirectUri: window.location.origin,
       }),
     });
 

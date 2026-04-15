@@ -3,12 +3,11 @@ import {
   AuthConfig,
   User,
   fetchAuthConfig,
+  getApiBaseUrl,
   getStoredToken,
   getStoredUser,
   storeToken,
   storeUser,
-  clearToken,
-  clearUser,
   logout as logoutUtil,
   loginWithMicrosoft,
   loginWithGoogle,
@@ -76,45 +75,25 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             storeToken(newToken);
 
             // Fetch user info from backend using the token
-            try {
-              const response = await fetch(`${import.meta.env.VITE_PORTAL_API_BASE_URL || ''}/api/user`, {
-                headers: {
-                  Authorization: `Bearer ${newToken}`,
-                },
-              });
+            const response = await fetch(`${getApiBaseUrl()}/api/user`, {
+              headers: {
+                Authorization: `Bearer ${newToken}`,
+              },
+            });
 
-              if (response.ok) {
-                const userData = await response.json();
-                setUser(userData);
-                storeUser(userData);
-              } else {
-                // If user endpoint doesn't exist, create a basic user object
-                const basicUser: User = {
-                  id: code,
-                  email: "user@example.com",
-                  displayName: "User",
-                  provider: "microsoft",
-                  providerId: code,
-                };
-                setUser(basicUser);
-                storeUser(basicUser);
-              }
-            } catch {
-              // If user endpoint doesn't exist, create a basic user object
-              const basicUser: User = {
-                id: code,
-                email: "user@example.com",
-                displayName: "User",
-                provider: "microsoft",
-                providerId: code,
-              };
-              setUser(basicUser);
-              storeUser(basicUser);
+            if (!response.ok) {
+              throw new Error(`Failed to load user profile (${response.status})`);
             }
+
+            const userData = (await response.json()) as User;
+            setUser(userData);
+            storeUser(userData);
 
             // Clean up URL
             window.history.replaceState({}, document.title, window.location.pathname);
           } catch (err) {
+            // Ensure partially stored callback state doesn't leave a ghost session.
+            logoutUtil();
             setError(`OAuth callback failed: ${err instanceof Error ? err.message : String(err)}`);
             console.error("[auth] OAuth callback error:", err);
             window.history.replaceState({}, document.title, window.location.pathname);
