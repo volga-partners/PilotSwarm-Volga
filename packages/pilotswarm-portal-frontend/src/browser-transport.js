@@ -30,7 +30,7 @@ export class BrowserPortalTransport {
         this.onUnauthorized = typeof onUnauthorized === "function" ? onUnauthorized : () => {};
         this.bootstrap = null;
         this.apiBaseUrl = trimTrailingSlash(import.meta.env.VITE_PORTAL_API_BASE_URL || "");
-        this.socketBaseUrl = toWebSocketUrl(import.meta.env.VITE_PORTAL_WS_URL || this.apiBaseUrl);
+        this.socketBaseUrl = toWebSocketUrl(import.meta.env.VITE_PORTAL_WS_URL || "");
         this.socket = null;
         this.socketOpenPromise = null;
         this.reconnectTimer = null;
@@ -41,8 +41,8 @@ export class BrowserPortalTransport {
 
     async start() {
         this.stopped = false;
-        this.bootstrap = await this.fetchJson("/api/bootstrap", { method: "GET" });
         await this.ensureSocket();
+        this.bootstrap = await this.fetchJson("/api/bootstrap", { method: "GET" }).catch(() => null);
     }
 
     async stop() {
@@ -135,12 +135,16 @@ export class BrowserPortalTransport {
         this.socketOpenPromise = (async () => {
             const token = await this.getAccessToken();
             const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-            const socketUrl = this.socketBaseUrl
+            let socketUrl = this.socketBaseUrl
                 ? `${this.socketBaseUrl}/portal-ws`
                 : `${protocol}//${window.location.host}/portal-ws`;
-            const socket = token
-                ? new WebSocket(socketUrl, ["access_token", token])
-                : new WebSocket(socketUrl);
+
+            // Add token as query parameter if available
+            if (token) {
+                socketUrl += `?token=${encodeURIComponent(token)}`;
+            }
+
+            const socket = new WebSocket(socketUrl);
             this.socket = socket;
 
             socket.addEventListener("message", (event) => {
@@ -177,7 +181,11 @@ export class BrowserPortalTransport {
                 socket.addEventListener("open", resolve, { once: true });
                 socket.addEventListener("error", () => reject(new Error("WebSocket connection failed")), { once: true });
                 socket.addEventListener("close", (event) => {
-                    if (event.code === 4401) reject(new Error("Unauthorized"));
+                    if (event.code === 4401) {
+                        reject(new Error("Unauthorized"));
+                    } else {
+                        reject(new Error(`WebSocket closed with code ${event.code}`));
+                    }
                 }, { once: true });
             });
 

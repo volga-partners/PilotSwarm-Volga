@@ -1,8 +1,10 @@
 import { useNavigate } from "react-router-dom";
+import { useAuth } from "../../hooks/AuthContext";
 import styles from "./HomePage.module.css";
 
 export function HomePage() {
   const navigate = useNavigate();
+  const { error } = useAuth();
 
   return (
     <div className={styles.container}>
@@ -10,6 +12,20 @@ export function HomePage() {
       <nav className={styles.navbar}>
         <div className={styles.logo}>🚁 PilotSwarm</div>
       </nav>
+
+      {/* Error Message */}
+      {error && (
+        <div style={{
+          padding: "16px",
+          margin: "16px",
+          backgroundColor: "#fee",
+          border: "1px solid #f88",
+          borderRadius: "4px",
+          color: "#c00"
+        }}>
+          <strong>Error:</strong> {error}
+        </div>
+      )}
 
       {/* Main Content */}
       <div className={styles.content}>
