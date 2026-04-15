@@ -4,8 +4,14 @@
 
 // Load .env file first, before any other imports that use process.env
 import dotenv from "dotenv";
-const result = dotenv.config();
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const envPath = path.resolve(__dirname, "../.env");
+const result = dotenv.config({ path: envPath });
 console.log("[index] dotenv.config() result:", result.parsed ? Object.keys(result.parsed).length + " vars" : "none");
+console.log("[index] dotenv path:", envPath);
 console.log("[index] GOOGLE_CLIENT_ID from process.env:", process.env.GOOGLE_CLIENT_ID ? "✓" : "✗");
 
 // Static imports that don't depend on config
@@ -50,13 +56,57 @@ async function startServer() {
 
     // Attach WebSocket server
     const wss = new WebSocketServer({ server, path: "/portal-ws" });
-    wss.on("connection", (ws, req) => handleWsConnection(ws, req));
+    wss.on("connection", (ws, req) => {
+      // Never let async connection errors crash the process.
+      handleWsConnection(ws, req).catch((err) => {
+        console.error("[ws] Connection handler failed:", err?.message || err);
+        try {
+          ws.close(1011, "Internal server error");
+        } catch {}
+      });
+    });
+    wss.on("error", (err) => {
+      console.error("[ws] WebSocket server error:", err?.message || err);
+    });
 
-    // Graceful shutdown
-    async function shutdown() {
-      console.log("[server] Shutting down...");
+    let isShuttingDown = false;
+    let forceExitTimer = null;
 
-      // Close WebSocket connections
+    async function withTimeout(task, label, timeoutMs = 4000) {
+      try {
+        await Promise.race([
+          Promise.resolve().then(task),
+          new Promise((_, reject) => {
+            const t = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+            t.unref?.();
+          }),
+        ]);
+      } catch (err) {
+        console.error(`[server] ${label} failed:`, err?.message || err);
+      }
+    }
+
+    // Graceful shutdown (with a safety fallback so Ctrl+C always exits)
+    async function shutdown(signal = "SIGTERM") {
+      if (isShuttingDown) {
+        console.warn(`[server] Received ${signal} while shutting down — forcing exit`);
+        process.exit(1);
+      }
+      isShuttingDown = true;
+      console.log(`[server] ${signal} received. Shutting down...`);
+
+      forceExitTimer = setTimeout(() => {
+        console.error("[server] Forced exit: shutdown exceeded timeout");
+        process.exit(1);
+      }, 5000);
+      forceExitTimer.unref?.();
+
+      // Close WebSocket server and connections (do this first)
+      try {
+        wss.close();
+      } catch (err) {
+        console.error("[ws] Error closing WebSocket server:", err?.message);
+      }
       for (const client of wss.clients) {
         try {
           client.close();
@@ -64,18 +114,30 @@ async function startServer() {
       }
 
       // Stop runtime
-      await stopRuntimeService().catch(() => {});
+      await withTimeout(() => stopRuntimeService(), "Stop runtime", 2000);
 
       // Close database
-      await closeDb().catch(() => {});
+      await withTimeout(() => closeDb(), "Close database", 2000);
 
       // Close HTTP server
-      server.close();
+      await withTimeout(
+        () => new Promise((resolve) => {
+          server.close(() => {
+            console.log("[server] HTTP server closed");
+            resolve();
+          });
+        }),
+        "Close HTTP server",
+        2000
+      );
+
+      if (forceExitTimer) clearTimeout(forceExitTimer);
+      console.log("[server] Shutdown complete");
       process.exit(0);
     }
 
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
 
     // Start listening
     await new Promise((resolve, reject) => {

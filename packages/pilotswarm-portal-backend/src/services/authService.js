@@ -25,9 +25,9 @@ export function getMicrosoftConfig() {
  * Returns null if GOOGLE_CLIENT_ID not set.
  */
 export function getGoogleConfig() {
-  const { clientId } = config.auth.google;
+  const { clientId, clientSecret } = config.auth.google;
   if (!clientId) return null;
-  return { clientId };
+  return { clientId, clientSecret };
 }
 
 /**
@@ -102,14 +102,19 @@ export async function validateMicrosoftToken(token) {
 export async function validateGoogleToken(token) {
   try {
     const googleConfig = getGoogleConfig();
-    if (!googleConfig) return null;
+    if (!googleConfig) {
+      console.log("[validateGoogleToken] No Google config");
+      return null;
+    }
 
+    console.log("[validateGoogleToken] Verifying ID token with clientId:", googleConfig.clientId);
     const client = new OAuth2Client(googleConfig.clientId);
     const ticket = await client.verifyIdToken({
       idToken: token,
       audience: googleConfig.clientId,
     });
     const payload = ticket.getPayload();
+    console.log("[validateGoogleToken] Token verified successfully for:", payload.email);
 
     return {
       id: `google:${payload.sub}`,
@@ -119,7 +124,8 @@ export async function validateGoogleToken(token) {
       providerId: payload.sub,
     };
   } catch (err) {
-    console.error("[authService] Google validation failed:", err.message);
+    console.error("[validateGoogleToken] Google validation failed:", err.message);
+    console.error("[validateGoogleToken] Error stack:", err.stack);
     return null;
   }
 }
@@ -129,30 +135,40 @@ export async function validateGoogleToken(token) {
  * Returns normalized user info or null if invalid.
  */
 export async function validateToken(token) {
-  if (!token) return null;
+  if (!token) {
+    console.log("[validateToken] No token provided");
+    return null;
+  }
 
   const payload = decodeTokenPayload(token);
-  if (!payload) return null;
+  if (!payload) {
+    console.log("[validateToken] Failed to decode token payload");
+    return null;
+  }
 
   const iss = String(payload.iss || "");
+  console.log("[validateToken] Detected issuer:", iss);
 
   // Google issuer
   if (iss.includes("accounts.google.com")) {
+    console.log("[validateToken] Calling validateGoogleToken");
     return validateGoogleToken(token);
   }
 
   // Microsoft issuer
   if (iss.includes("login.microsoftonline.com")) {
+    console.log("[validateToken] Calling validateMicrosoftToken");
     return validateMicrosoftToken(token);
   }
 
+  console.log("[validateToken] Unknown issuer, returning null");
   return null;
 }
 
 /**
  * Extract Bearer token from HTTP or WebSocket request.
  * HTTP: reads Authorization: Bearer <token> header
- * WS: reads sec-websocket-protocol header in format "access_token, <token>"
+ * WS: reads query parameter ?token=<token> or sec-websocket-protocol header
  */
 export function extractToken(req) {
   // HTTP Authorization header
@@ -162,7 +178,18 @@ export function extractToken(req) {
     if (match) return match[1];
   }
 
-  // WebSocket sec-websocket-protocol header
+  // WebSocket query parameter (e.g., ?token=<token>)
+  if (req.url) {
+    try {
+      const url = new URL(req.url, `http://${req.headers?.host || "localhost"}`);
+      const token = url.searchParams.get("token");
+      if (token) return token;
+    } catch (err) {
+      console.log("[extractToken] Error parsing URL:", err.message);
+    }
+  }
+
+  // WebSocket sec-websocket-protocol header (legacy)
   const protocol = req.headers?.["sec-websocket-protocol"];
   if (protocol) {
     const parts = protocol.split(",").map((p) => p.trim());

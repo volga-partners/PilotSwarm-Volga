@@ -15,6 +15,7 @@ export const config = {
     },
     google: {
       clientId: process.env.GOOGLE_CLIENT_ID || null,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET || null,
     },
   },
   tls: {
