@@ -12,24 +12,30 @@ function isSafeThemeId(value) {
 }
 
 export async function handleWsConnection(ws, req) {
+  console.log("[wsHandler] New WebSocket connection attempt from:", req.url);
   const authConfig = getAuthConfig();
   let userId = null;
 
   // Authenticate at connection time (if auth is enabled)
   if (authConfig) {
+    console.log("[wsHandler] Auth enabled, extracting token...");
     const token = extractToken(req);
     if (!token) {
+      console.log("[wsHandler] No token found, closing connection (401)");
       ws.close(4401, "Unauthorized");
       return;
     }
 
+    console.log("[wsHandler] Token found, validating...");
     const userInfo = await validateToken(token);
     if (!userInfo) {
+      console.log("[wsHandler] Token validation failed, closing connection (401)");
       ws.close(4401, "Unauthorized");
       return;
     }
 
     userId = userInfo.id;
+    console.log("[wsHandler] WebSocket authenticated for user:", userId);
 
     // Auto-provision user
     try {
