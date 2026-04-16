@@ -426,6 +426,9 @@ export interface PilotSwarmWorkerOptions {
      */
     turnTimeoutMs?: number;
 
+    /** Prompt-injection guardrail configuration. Enabled by default. */
+    promptGuardrails?: PromptGuardrailConfig;
+
     /**
      * Base directory for local session state files.
      * Default: `~/.copilot/session-state`.
