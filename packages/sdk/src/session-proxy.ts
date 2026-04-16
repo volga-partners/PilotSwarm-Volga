@@ -9,6 +9,15 @@ import { PilotSwarmManagementClient, type SessionOrchestrationStats } from "./ma
 import { loadKnowledgeIndexFromFactStore } from "./knowledge-index.js";
 import { mergePromptSections } from "./prompt-layering.js";
 import { formatSessionOwnerLabel, getSessionOwnerKind, matchesSessionOwnerFilters } from "./session-owner-utils.js";
+import {
+    buildGuardedTurnPrompt,
+    buildPromptGuardrailRefusal,
+    containsUnsafeAuthorityClaim,
+    evaluatePromptGuardrails,
+    isHighRiskTurnResult,
+    shouldRunPromptGuardrailDetector,
+} from "./prompt-guardrails.js";
+import { formatSessionOwnerLabel, getSessionOwnerKind, matchesSessionOwnerFilters } from "./session-owner-utils.js";
 import os from "node:os";
 import fs from "node:fs";
 
@@ -95,6 +104,15 @@ function buildLossyReplayMessage(sessionId: string, detail: string): string {
     return `The runtime detected missing Copilot session state for ${sessionId} while resuming a later turn. ` +
         `It will recreate a fresh Copilot session and replay the pending turn from durable orchestration context. ` +
         `Some very recent work may be missing or partially executed. ${detail}`.trim();
+}
+
+function detectPromptSource(
+    prompt: string,
+    bootstrap?: boolean,
+): import("./types.js").PromptSource {
+    if (bootstrap) return "system_generated";
+    if (/^\[CHILD_UPDATE from=(\S+) type=(\S+)/.test(prompt)) return "sub_agent";
+    return "user";
 }
 
 function normalizeEventData(eventData?: Record<string, unknown>): Record<string, unknown> | null {
