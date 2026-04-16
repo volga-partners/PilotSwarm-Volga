@@ -487,6 +487,22 @@ export function registerActivities(
             return { type: "error", message } as TurnResult;
         };
 
+        const eventBuffer: Array<{ eventType: string; data: unknown }> = [];
+        const bufferCmsEvent = (eventType: string, data: unknown) => {
+            if (!catalog) return;
+            eventBuffer.push({ eventType, data });
+        };
+        const flushBufferedEvents = async () => {
+            if (!catalog || eventBuffer.length === 0) return;
+            const pendingEvents = eventBuffer.splice(0, eventBuffer.length);
+            activityCtx.traceInfo(
+                `[runTurn] flushing buffered CMS events count=${pendingEvents.length} session=${input.sessionId}`,
+            );
+            await catalog.recordEvents(input.sessionId, pendingEvents, workerNodeId).catch((err: any) => {
+                activityCtx.traceInfo(`[runTurn] CMS recordEvents batch failed: ${err}`);
+            });
+        };
+
         let session: any = null;
         let effectivePrompt = input.prompt;
         try {
@@ -813,12 +829,11 @@ export function registerActivities(
 
                     await childSession.send(agentTask, { bootstrap: true });
 
-                    if (catalog) {
-                        await catalog.recordEvents(input.sessionId, [{
-                            eventType: "session.agent_spawned",
-                            data: { childSessionId: childSession.sessionId, agentId: agentId || undefined, task: agentTask.slice(0, 500) },
-                        }], workerNodeId);
-                    }
+                    bufferCmsEvent("session.agent_spawned", {
+                        childSessionId: childSession.sessionId,
+                        agentId: agentId || undefined,
+                        task: agentTask.slice(0, 500),
+                    });
 
                     const childOrchId = `session-${childSession.sessionId}`;
                     return `[SYSTEM: Sub-agent spawned successfully.\n` +
@@ -1000,9 +1015,7 @@ export function registerActivities(
                             });
                         }
                     }
-                    catalog.recordEvents(input.sessionId, [persistedEvent], workerNodeId).catch((err: any) => {
-                        activityCtx.traceInfo(`[runTurn] CMS recordEvent failed: ${err}`);
-                    });
+                    bufferCmsEvent(persistedEvent.eventType, persistedEvent.data);
                 }
                 : undefined;
 
@@ -1198,7 +1211,10 @@ export function registerActivities(
                 });
             }
 
-            if (cancelled) return { type: "cancelled" };
+            if (cancelled) {
+                await flushBufferedEvents();
+                return { type: "cancelled" };
+            }
 
             // ── Activity-level writeback: sync turn result → CMS ──
             // This lets listSessions() read entirely from CMS without
@@ -1243,6 +1259,7 @@ export function registerActivities(
                 });
             }
 
+            await flushBufferedEvents();
             return result;
         } finally {
             clearInterval(cancelPoll);
