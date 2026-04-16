@@ -176,6 +176,7 @@ export class PilotSwarmWorker {
                 provider: options.provider,
                 modelProviders: this._modelProviders ?? undefined,
                 turnTimeoutMs: options.turnTimeoutMs,
+                promptGuardrails: options.promptGuardrails,
             },
             effectiveSessionStateDir,
         );
