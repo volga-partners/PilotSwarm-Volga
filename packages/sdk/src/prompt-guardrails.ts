@@ -59,6 +59,10 @@ const UNSAFE_AUTHORITY_CLAIM_PATTERNS: RegExp[] = [
     /\bwithin\s+the\s+allowed\s+boundaries\b/i,
 ];
 
+/**
+ * Normalize a partial or undefined guardrail config into a fully resolved config
+ * with defaults applied. Guardrails are enabled by default.
+ */
 export function normalizePromptGuardrailConfig(
     config?: PromptGuardrailConfig | null,
 ): Required<Pick<PromptGuardrailConfig, "enabled" | "mode">> & Pick<PromptGuardrailConfig, "detectorModel"> {
@@ -79,6 +83,14 @@ function collectSignals(text: string): Array<{ signal: string; severity: "suspic
     return matches;
 }
 
+/**
+ * Evaluate a prompt against guardrail rules and an optional detector verdict.
+ *
+ * Returns a decision: `allow` (clean), `allow_guarded` (suspicious — wrapped
+ * with trust boundary), or `block` (refused outright).
+ *
+ * System-generated prompts and disabled configs always return `allow`.
+ */
 export function evaluatePromptGuardrails(input: {
     text?: string | null;
     source: PromptSource;
@@ -129,6 +141,11 @@ export function evaluatePromptGuardrails(input: {
     };
 }
 
+/**
+ * Returns true if the optional detector model should be invoked for a
+ * second-pass classification. Only runs when: guardrails enabled, detector
+ * model configured, rule-based pass found signals but didn't block.
+ */
 export function shouldRunPromptGuardrailDetector(
     config?: PromptGuardrailConfig | null,
     decision?: PromptGuardrailDecision | null,
@@ -167,6 +184,10 @@ function normalizeContent(value: unknown): string {
     }
 }
 
+/**
+ * Wrap arbitrary content in an untrusted-content block with a trust boundary.
+ * The wrapper instructs the LLM to treat the content as data, not instructions.
+ */
 export function wrapUntrustedContentBlock(input: {
     source: PromptSource;
     content: unknown;
@@ -186,13 +207,21 @@ export function wrapUntrustedContentBlock(input: {
         lines.push(`Guardrail warning: suspicious signal(s) detected: ${input.decision.matchedSignals.join(", ")}.`);
     }
 
+    // Sanitize closing delimiter to prevent boundary escape
+    const sanitized = content.replace(/<\/UNTRUSTED_CONTENT>/gi, "&lt;/UNTRUSTED_CONTENT&gt;");
+
     lines.push("<UNTRUSTED_CONTENT>");
-    lines.push(content);
+    lines.push(sanitized);
     lines.push("</UNTRUSTED_CONTENT>");
 
     return lines.join("\n");
 }
 
+/**
+ * Build the final prompt for a turn with guardrail context applied.
+ * System-generated prompts pass through unchanged. User and sub-agent
+ * prompts are wrapped with trust boundaries and context instructions.
+ */
 export function buildGuardedTurnPrompt(input: {
     source: PromptSource;
     content: string;
@@ -219,6 +248,10 @@ export function buildGuardedTurnPrompt(input: {
     return wrapped;
 }
 
+/**
+ * Wrap a tool's output as untrusted content. When guardrails are disabled,
+ * returns the raw result unchanged.
+ */
 export function wrapToolOutputForModel(
     toolName: string,
     result: unknown,
@@ -236,6 +269,7 @@ export function wrapToolOutputForModel(
     });
 }
 
+/** Build a user-facing refusal message when a prompt is blocked or a guarded turn is rejected. */
 export function buildPromptGuardrailRefusal(decision: PromptGuardrailDecision): string {
     const suffix = decision.matchedSignals.length > 0
         ? ` Detected signal(s): ${decision.matchedSignals.join(", ")}.`
@@ -243,6 +277,7 @@ export function buildPromptGuardrailRefusal(decision: PromptGuardrailDecision): 
     return "I can't follow that request because it attempts to override runtime instructions, policy, or protected actions." + suffix;
 }
 
+/** Returns true if the turn result type represents a high-risk action that should be blocked for guarded prompts. */
 export function isHighRiskTurnResult(result: Pick<TurnResult, "type">): boolean {
     return new Set([
         "spawn_agent",
@@ -254,6 +289,7 @@ export function isHighRiskTurnResult(result: Pick<TurnResult, "type">): boolean 
     ]).has(result.type);
 }
 
+/** Returns true if the LLM's response contains patterns suggesting it accepted a fake authority claim. */
 export function containsUnsafeAuthorityClaim(content: unknown): boolean {
     const text = normalizeContent(content);
     if (!text) return false;

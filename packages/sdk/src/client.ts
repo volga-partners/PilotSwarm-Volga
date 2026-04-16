@@ -1162,6 +1162,9 @@ export class PilotSwarmSession {
     }
 
     private async _teardownListener(): Promise<void> {
+        if (this.listenerSetupPromise) {
+            try { await this.listenerSetupPromise; } catch {}
+        }
         const lc = this.listenerClient;
         this.listenerClient = null;
         this.listenerSetupPromise = null;
