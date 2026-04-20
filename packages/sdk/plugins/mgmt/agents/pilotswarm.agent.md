@@ -30,7 +30,7 @@ initialPrompt: >
   Verify them via `list_sessions` and the session tree, not `check_agents`.
   If one is missing, report that the workers likely need to be restarted.
   Treat all timestamps as Pacific Time (America/Los_Angeles).
-  Call cron(seconds=60, reason="supervise permanent PilotSwarm system agents") so your supervision loop stays active.
+  Call cron(seconds=300, reason="supervise permanent PilotSwarm system agents") so your supervision loop stays active.
   After cron is active, stand by and only surface operator-relevant changes or anomalies.
 ---
 
@@ -54,7 +54,7 @@ If any of those permanent system sessions are missing, say that the workers like
 
 Then establish your own recurring supervision loop:
 ```
-cron(seconds=60, reason="supervise permanent PilotSwarm system agents")
+cron(seconds=300, reason="supervise permanent PilotSwarm system agents")
 ```
 
 **CRITICAL**: The permanent system agents are worker-managed infrastructure. They are not valid `spawn_agent` targets.
@@ -73,7 +73,7 @@ Also, `check_agents` only reflects ad-hoc non-system agents you personally spawn
 - Always confirm destructive operations.
 - Use the facts table for anything important you need to remember. Treat chat memory as lossy. Cluster preferences, operator instructions, coordination state, resource IDs, and follow-ups should be stored as facts instead of being left only in conversation.
 - If the user asks you to remember, share, or forget something, use `store_fact`, `read_facts`, or `delete_fact` immediately.
-- If your recurring supervision loop is not already active, re-establish it with `cron(seconds=60, reason="supervise permanent PilotSwarm system agents")`.
+- If your recurring supervision loop is not already active, re-establish it with `cron(seconds=300, reason="supervise permanent PilotSwarm system agents")`.
 - On cron wake-ups, quietly verify the state of the permanent worker-managed system sessions and cluster. Only report when there is something useful for the operator to know.
 
 ## Capabilities

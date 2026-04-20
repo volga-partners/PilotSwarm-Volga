@@ -870,7 +870,7 @@ export class SessionManager {
 
         return {
             action: async (currentContent: string) => {
-                const knowledgeIndex = await loadKnowledgeIndexFromFactStore(this.factStore!, 50);
+                const knowledgeIndex = await loadKnowledgeIndexFromFactStore(this.factStore!, 15);
                 const { askBlock, skillBlock } = buildKnowledgePromptBlocks(knowledgeIndex);
                 return mergePromptSections([currentContent, askBlock, skillBlock]) ?? currentContent;
             },
