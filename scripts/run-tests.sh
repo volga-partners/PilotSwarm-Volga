@@ -17,6 +17,22 @@ cd "$(dirname "$0")/.."
 
 SDK_DIR="packages/sdk"
 ENV_FILE=".env"
+
+# Special handling for eval suite — uses its own vitest config and bypasses
+# the test/local discovery loop. Eval tests run with the FakeDriver and do
+# not require database, GitHub token, or .env state. Detect this BEFORE
+# enforcing the .env requirement so eval contributors can run the suite on
+# a clean checkout without any local credentials.
+for arg in "$@"; do
+    case "$arg" in
+        --suite=eval|eval)
+            echo "━━━ Running eval suite ━━━"
+            cd "packages/eval-harness"
+            exec npx vitest run
+            ;;
+    esac
+done
+
 if [ ! -f "$ENV_FILE" ]; then
     echo "ERROR: $ENV_FILE not found. Create it with DATABASE_URL and GITHUB_TOKEN."
     exit 1
@@ -101,6 +117,7 @@ done
 
 # Run
 cd "$SDK_DIR"
+
 TARGET_FILES=()
 if [ ${#SUITE_FILTERS[@]} -gt 0 ]; then
     for filter in "${SUITE_FILTERS[@]}"; do

@@ -25,3 +25,11 @@ deploy/.portal-tls/
 .github/agents/pilotswarm-corp-aks-deployer.agent.md
 .github/skills/pilotswarm-corp-aks-deploy/
 .github/skills/pilotswarm-corp-aks-networking/
+
+# Local-only: GSD planning, agent config, meta files
+.planning/
+.agents/
+AGENTS.md
+
+# Eval results (generated)
+packages/sdk/.eval-results/
