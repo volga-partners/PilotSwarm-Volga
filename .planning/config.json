@@ -1,0 +1,6 @@
+{
+  "workflow": {
+    "skip_discuss": true
+  },
+  "commit_docs": false
+}
