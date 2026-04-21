@@ -639,7 +639,7 @@ export function* durableSessionOrchestration_1_0_32(
 
     // ─── Helper: summarize session title if due ──────────────
     const FIRST_SUMMARIZE_DELAY = 60_000;
-    const REPEAT_SUMMARIZE_DELAY = 300_000;
+    const REPEAT_SUMMARIZE_DELAY = 1_800_000;
     function* maybeSummarize(): Generator<any, void, any> {
         if (isSystem) return;
         const now: number = yield ctx.utcNow();
