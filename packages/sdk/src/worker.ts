@@ -312,7 +312,7 @@ export class PilotSwarmWorker {
         }
 
         this.runtime = new Runtime(this._provider, {
-            dispatcherPollIntervalMs: 10,
+            dispatcherPollIntervalMs: 500,
             workerLockTimeoutMs: 10_000,
             logLevel: this.config.logLevel ?? "error",
             maxSessionsPerRuntime: this.config.maxSessionsPerRuntime ?? 50,

@@ -508,7 +508,7 @@ export function* durableSessionOrchestration_1_0_29(
 
     // ─── Helper: summarize session title if due ──────────────
     const FIRST_SUMMARIZE_DELAY = 60_000;    // 1 minute
-    const REPEAT_SUMMARIZE_DELAY = 300_000;  // 5 minutes
+    const REPEAT_SUMMARIZE_DELAY = 1_800_000;  // 30 minutes
     function* maybeSummarize(): Generator<any, void, any> {
         // System sessions have fixed titles — never summarize
         if (isSystem) return;
