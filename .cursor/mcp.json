@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "pilotswarm": {
+      "command": "node",
+      "args": [
+        "packages/mcp-server/dist/bin/pilotswarm-mcp.js",
+        "--store",
+        "postgresql://postgres:postgres@localhost:5432/pilotswarm",
+        "--model-providers",
+        ".model_providers.json"
+      ],
+      "env": {
+        "NODE_OPTIONS": "--env-file=.env"
+      }
+    }
+  }
+}

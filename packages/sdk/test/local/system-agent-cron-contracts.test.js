@@ -33,9 +33,9 @@ describe("system agent cron contracts", () => {
         const resourcemgr = readRepoFile("packages/sdk/plugins/mgmt/agents/resourcemgr.agent.md");
         const factsManager = readRepoFile("packages/sdk/plugins/mgmt/agents/facts-manager.agent.md");
 
-        assertIncludes(pilotswarm, 'cron(seconds=60, reason="supervise permanent PilotSwarm system agents")', "pilotswarm should maintain its supervision loop via cron");
-        assertIncludes(sweeper, "cron(seconds=60", "sweeper should establish a recurring cron schedule");
-        assertIncludes(resourcemgr, "cron(seconds=300", "resource manager should establish a recurring cron schedule");
+        assertIncludes(pilotswarm, 'cron(seconds=300, reason="supervise permanent PilotSwarm system agents")', "pilotswarm should maintain its supervision loop via cron");
+        assertIncludes(sweeper, "cron(seconds=300", "sweeper should establish a recurring cron schedule");
+        assertIncludes(resourcemgr, "cron(seconds=900", "resource manager should establish a recurring cron schedule");
         assertIncludes(factsManager, "cron(seconds=<interval>", "facts manager should schedule curation via cron");
         assert(!pilotswarm.includes("For ANY waiting, use the `wait` tool."), "pilotswarm should not require wait for its main loop");
         assert(!sweeper.includes("ALWAYS end every turn by calling the wait tool"), "sweeper should not require wait for its main loop");

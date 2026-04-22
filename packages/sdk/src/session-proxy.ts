@@ -139,9 +139,12 @@ async function maybeClassifyWithDetector(
             `<UNTRUSTED_CONTENT>\n${sanitizedPrompt}\n</UNTRUSTED_CONTENT>`;
         let response = "";
         detectorSession.on("assistant.message_delta", (evt: any) => { response += evt?.content ?? ""; });
-        await new Promise<void>((resolve) => {
-            detectorSession.on("session.idle", () => resolve());
-            detectorSession.send(detectorPrompt);
+        const DETECTOR_TIMEOUT_MS = 15_000;
+        await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error("detector timeout")), DETECTOR_TIMEOUT_MS);
+            detectorSession.on("session.idle", () => { clearTimeout(timer); resolve(); });
+            detectorSession.on("session.error", (err: any) => { clearTimeout(timer); reject(err); });
+            detectorSession.send(detectorPrompt).catch((err: any) => { clearTimeout(timer); reject(err); });
         });
         const normalized = response.trim().toLowerCase();
         const verdict: import("./types.js").PromptGuardrailVerdict =
@@ -202,6 +205,12 @@ function buildUsageSummaryUpsert(data: unknown): {
     tokensCacheReadIncrement?: number;
     tokensCacheWriteIncrement?: number;
 } | null {
+    // Convention: tokensInputIncrement is the *inclusive* prompt-token count
+    // (i.e. it INCLUDES tokensCacheReadIncrement). This matches the
+    // OpenAI/Anthropic billing shape and is what computeCacheHitRatio() in
+    // cms.ts assumes when it derives cache_read / input. If a future provider
+    // ever reports input_tokens excluding the cached prefix, normalize here
+    // BEFORE storing — do not invert the convention downstream.
     const usage = (data ?? {}) as Record<string, unknown>;
     const tokensInputIncrement = finiteMetricNumber(usage.inputTokens ?? usage.prompt_tokens);
     const tokensOutputIncrement = finiteMetricNumber(usage.outputTokens ?? usage.completion_tokens);
