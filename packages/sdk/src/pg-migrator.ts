@@ -11,13 +11,16 @@ export interface MigrationEntry {
     version: string;
     name: string;
     sql: string;
+    /** Run outside BEGIN/COMMIT (required for statements like CREATE INDEX CONCURRENTLY). */
+    transactional?: boolean;
 }
 
 /**
  * Run all pending migrations against the given schema.
  *
  * Uses a PostgreSQL advisory lock keyed on `lockSeed` + schema name to
- * serialize concurrent workers. Each migration runs in its own transaction.
+ * serialize concurrent workers. Each migration runs in its own transaction
+ * unless it is explicitly marked `transactional: false`.
  *
  * @param pool      - node-postgres pool
  * @param schema    - target schema name (e.g. "copilot_sessions", "pilotswarm_facts")
@@ -53,6 +56,15 @@ export async function runMigrations(
 
         for (const migration of migrations) {
             if (appliedSet.has(migration.version)) continue;
+
+            if (migration.transactional === false) {
+                await client.query(migration.sql);
+                await client.query(
+                    `INSERT INTO ${migrationsTable} (version, name) VALUES ($1, $2)`,
+                    [migration.version, migration.name],
+                );
+                continue;
+            }
 
             try {
                 await client.query("BEGIN");
