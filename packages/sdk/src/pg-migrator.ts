@@ -11,6 +11,8 @@ export interface MigrationEntry {
     version: string;
     name: string;
     sql: string;
+    /** Execute these statements sequentially instead of sending one semicolon-joined batch. */
+    statements?: string[];
     /** Run outside BEGIN/COMMIT (required for statements like CREATE INDEX CONCURRENTLY). */
     transactional?: boolean;
 }
@@ -56,9 +58,14 @@ export async function runMigrations(
 
         for (const migration of migrations) {
             if (appliedSet.has(migration.version)) continue;
+            const statements = migration.statements?.length
+                ? migration.statements
+                : [migration.sql];
 
             if (migration.transactional === false) {
-                await client.query(migration.sql);
+                for (const statement of statements) {
+                    await client.query(statement);
+                }
                 await client.query(
                     `INSERT INTO ${migrationsTable} (version, name) VALUES ($1, $2)`,
                     [migration.version, migration.name],
@@ -68,7 +75,9 @@ export async function runMigrations(
 
             try {
                 await client.query("BEGIN");
-                await client.query(migration.sql);
+                for (const statement of statements) {
+                    await client.query(statement);
+                }
                 await client.query(
                     `INSERT INTO ${migrationsTable} (version, name) VALUES ($1, $2)`,
                     [migration.version, migration.name],
