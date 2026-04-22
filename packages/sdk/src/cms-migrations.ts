@@ -14,6 +14,9 @@ import type { MigrationEntry } from "./pg-migrator.js";
  * Migrations are idempotent (CREATE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
  */
 export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
+    const queryPerformanceIndexStatements =
+        migration_0008_session_indexes_for_tree_and_event_filters(schema);
+
     return [
         {
             version: "0001",
@@ -53,7 +56,8 @@ export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
         {
             version: "0008",
             name: "session_indexes_for_tree_and_event_filters",
-            sql: migration_0008_session_indexes_for_tree_and_event_filters(schema),
+            sql: queryPerformanceIndexStatements.join("\n"),
+            statements: queryPerformanceIndexStatements,
             transactional: false,
         },
     ];
@@ -861,18 +865,16 @@ $$ LANGUAGE plpgsql;
 
 // ─── Migration 0008: Query Performance Indexes ──────────────────
 
-function migration_0008_session_indexes_for_tree_and_event_filters(schema: string): string {
+function migration_0008_session_indexes_for_tree_and_event_filters(schema: string): string[] {
     const s = `"${schema}"`;
-    return `
--- 0008_session_indexes_for_tree_and_event_filters:
--- add indexes used by recursive tree reads and event-type filters.
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_parent
-    ON ${s}.sessions(parent_session_id) WHERE deleted_at IS NULL;
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_events_session_type
-    ON ${s}.session_events(session_id, event_type);
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_events_worker
-    ON ${s}.session_events(worker_node_id) WHERE worker_node_id IS NOT NULL;
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_active
-    ON ${s}.sessions(deleted_at) WHERE deleted_at IS NULL;
-`;
+    return [
+        `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_parent
+    ON ${s}.sessions(parent_session_id) WHERE deleted_at IS NULL;`,
+        `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_events_session_type
+    ON ${s}.session_events(session_id, event_type);`,
+        `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_events_worker
+    ON ${s}.session_events(worker_node_id) WHERE worker_node_id IS NOT NULL;`,
+        `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_active
+    ON ${s}.sessions(deleted_at) WHERE deleted_at IS NULL;`,
+    ];
 }
