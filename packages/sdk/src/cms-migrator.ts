@@ -14,6 +14,8 @@ export interface MigrationEntry {
     version: string;
     name: string;
     sql: string;
+    /** Run outside BEGIN/COMMIT (required for statements like CREATE INDEX CONCURRENTLY). */
+    transactional?: boolean;
 }
 
 /**
@@ -53,6 +55,15 @@ export async function runCmsMigrations(pool: any, schema: string): Promise<void>
         const migrations = CMS_MIGRATIONS(schema);
         for (const migration of migrations) {
             if (appliedSet.has(migration.version)) continue;
+
+            if (migration.transactional === false) {
+                await client.query(migration.sql);
+                await client.query(
+                    `INSERT INTO ${migrationsTable} (version, name) VALUES ($1, $2)`,
+                    [migration.version, migration.name],
+                );
+                continue;
+            }
 
             try {
                 await client.query("BEGIN");

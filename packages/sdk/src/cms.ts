@@ -216,6 +216,15 @@ export interface SessionCatalogProvider {
 
 const DEFAULT_SCHEMA = "copilot_sessions";
 export const SESSION_EVENTS_NOTIFY_CHANNEL = "session_events";
+const DEFAULT_DB_POOL_MAX = 10;
+const DEFAULT_EVENT_FETCH_LIMIT = 200;
+
+function resolveDbPoolMax(defaultMax = DEFAULT_DB_POOL_MAX): number {
+    const raw = process.env.DB_POOL_MAX;
+    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+    if (!Number.isFinite(parsed) || parsed <= 0) return defaultMax;
+    return parsed;
+}
 
 export function buildPgConnectionConfig(connectionString: string): {
     connectionString: string;
@@ -303,7 +312,7 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
         const { default: pg } = await import("pg");
 
         const pool = new pg.Pool({
-            max: 3,
+            max: resolveDbPoolMax(),
             ...buildPgConnectionConfig(connectionString),
         });
 
@@ -521,7 +530,7 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
     }
 
     async getSessionEvents(sessionId: string, afterSeq?: number, limit?: number): Promise<SessionEvent[]> {
-        const effectiveLimit = limit ?? 1000;
+        const effectiveLimit = limit ?? DEFAULT_EVENT_FETCH_LIMIT;
         let query: string;
         let params: unknown[];
 
@@ -545,7 +554,7 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
     }
 
     async getSessionEventsBefore(sessionId: string, beforeSeq: number, limit?: number): Promise<SessionEvent[]> {
-        const effectiveLimit = limit ?? 1000;
+        const effectiveLimit = limit ?? DEFAULT_EVENT_FETCH_LIMIT;
         const query = `SELECT * FROM (
                            SELECT * FROM ${this.sql.eventsTable}
                            WHERE session_id = $1 AND seq < $2
