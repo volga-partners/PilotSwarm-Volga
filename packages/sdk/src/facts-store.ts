@@ -63,6 +63,14 @@ export interface FactStore {
 }
 
 const DEFAULT_SCHEMA = "pilotswarm_facts";
+const DEFAULT_DB_POOL_MAX = 10;
+
+function resolveDbPoolMax(defaultMax = DEFAULT_DB_POOL_MAX): number {
+    const raw = process.env.DB_POOL_MAX;
+    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+    if (!Number.isFinite(parsed) || parsed <= 0) return defaultMax;
+    return parsed;
+}
 
 function sqlForSchema(schema: string) {
     const table = `${schema}.facts`;
@@ -139,7 +147,7 @@ export class PgFactStore implements FactStore {
 
         const pool = new pg.Pool({
             connectionString: parsed.toString(),
-            max: 3,
+            max: resolveDbPoolMax(),
             ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
         });
 

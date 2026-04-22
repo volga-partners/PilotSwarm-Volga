@@ -30,6 +30,12 @@ export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
             name: "session_metric_summaries_backfill_from_events",
             sql: migration_0003_session_metric_summaries_backfill_from_events(schema),
         },
+        {
+            version: "0004",
+            name: "session_indexes_for_tree_and_event_filters",
+            sql: migration_0004_session_indexes_for_tree_and_event_filters(schema),
+            transactional: false,
+        },
     ];
 }
 
@@ -177,5 +183,23 @@ SET
     updated_at = now()
 FROM event_metrics em
 WHERE sms.session_id = em.session_id;
+`;
+}
+
+// ─── Migration 0004: Query performance indexes ──────────────────
+
+function migration_0004_session_indexes_for_tree_and_event_filters(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+-- 0004_session_indexes_for_tree_and_event_filters:
+-- add indexes used by recursive tree reads and event-type filters.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_parent
+    ON ${s}.sessions(parent_session_id) WHERE deleted_at IS NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_events_session_type
+    ON ${s}.session_events(session_id, event_type);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_events_worker
+    ON ${s}.session_events(worker_node_id) WHERE worker_node_id IS NOT NULL;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_active
+    ON ${s}.sessions(deleted_at) WHERE deleted_at IS NULL;
 `;
 }
