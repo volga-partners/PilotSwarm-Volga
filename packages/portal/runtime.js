@@ -102,6 +102,13 @@ export class PortalRuntime {
                 return this.transport.getSharedFactsStats();
             case "pruneDeletedSummaries":
                 return this.transport.pruneDeletedSummaries(new Date(safeParams.olderThan));
+            case "getFleetObservabilityStats":
+                return this.transport.getFleetObservabilityStats({
+                    includeDeleted: safeParams.includeDeleted,
+                    since: safeParams.since ? new Date(safeParams.since) : undefined,
+                });
+            case "getDbCallMetrics":
+                return this.transport.getDbCallMetrics();
             case "getExecutionHistory":
                 return this.transport.getExecutionHistory(safeParams.sessionId, safeParams.executionId);
             case "createSession":

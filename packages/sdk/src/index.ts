@@ -28,6 +28,8 @@ export type {
     SessionOrchestrationStats,
     ExecutionHistoryEvent,
     PilotSwarmManagementClientOptions,
+    EnrichedFleetAgentRow,
+    EnrichedFleetStats,
 } from "./management-client.js";
 export { SessionManager } from "./session-manager.js";
 export { ManagedSession } from "./managed-session.js";
@@ -36,6 +38,10 @@ export { FilesystemSessionStore, FilesystemArtifactStore } from "./session-store
 export { PgFactStore, createFactStoreForUrl } from "./facts-store.js";
 export { PgSessionCatalogProvider, computeCacheHitRatio } from "./cms.js";
 export type { SessionCatalogProvider, SessionRow, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage } from "./cms.js";
+export { globalDbMetrics } from "./db-metrics.js";
+export type { DbMetricsSnapshot } from "./db-metrics.js";
+export { estimateCostUsd, MODEL_PRICING } from "./model-pricing.js";
+export type { ModelPricing } from "./model-pricing.js";
 export type {
     FactStore,
     FactRecord,
