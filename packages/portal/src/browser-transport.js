@@ -260,6 +260,17 @@ export class BrowserPortalTransport {
         });
     }
 
+    async getFleetObservabilityStats(opts) {
+        return this.rpc("getFleetObservabilityStats", {
+            includeDeleted: opts?.includeDeleted,
+            since: opts?.since instanceof Date ? opts.since.toISOString() : opts?.since,
+        });
+    }
+
+    async getDbCallMetrics() {
+        return this.rpc("getDbCallMetrics", {});
+    }
+
     async getExecutionHistory(sessionId, executionId) {
         return this.rpc("getExecutionHistory", { sessionId, executionId });
     }

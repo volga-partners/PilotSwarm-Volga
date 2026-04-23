@@ -37,6 +37,9 @@ import { createFactStoreForUrl } from "./facts-store.js";
 import { SessionDumper } from "./session-dumper.js";
 import { loadModelProviders, type ModelProviderRegistry, type ModelDescriptor } from "./model-providers.js";
 import { deriveStatusFromCmsAndRuntime, shouldSyncCompletedStatus, shouldSyncFailedStatus } from "./session-status.js";
+import { globalDbMetrics } from "./db-metrics.js";
+import type { DbMetricsSnapshot } from "./db-metrics.js";
+import { estimateCostUsd } from "./model-pricing.js";
 
 // duroxide is CommonJS — use createRequire for ESM compatibility
 import { createRequire } from "node:module";
@@ -210,6 +213,41 @@ export interface PilotSwarmManagementClientOptions {
      * If not provided, trace messages are discarded.
      */
     traceWriter?: (msg: string) => void;
+}
+
+/** Fleet agent row enriched with derived observability metrics. */
+export interface EnrichedFleetAgentRow {
+    agentId:                  string | null;
+    model:                    string | null;
+    sessionCount:             number;
+    totalSnapshotSizeBytes:   number;
+    totalDehydrationCount:    number;
+    totalHydrationCount:      number;
+    totalLossyHandoffCount:   number;
+    totalTokensInput:         number;
+    totalTokensOutput:        number;
+    totalTokensCacheRead:     number;
+    totalTokensCacheWrite:    number;
+    cacheHitRatio:            number | null;
+    totalTurnCount:           number;
+    totalErrorCount:          number;
+    totalToolCallCount:       number;
+    totalToolErrorCount:      number;
+    totalTurnDurationMs:      number;
+    /** Derived: totalErrorCount / totalTurnCount, or null when totalTurnCount === 0. */
+    errorRate:                number | null;
+    /** Derived: round(totalTurnDurationMs / totalTurnCount), or null when totalTurnCount === 0. */
+    avgTurnDurationMs:        number | null;
+    /** Derived: estimated USD cost from token counts against model pricing. */
+    estimatedCostUsd:         number;
+}
+
+/** Fleet stats enriched with per-agent derived metrics. */
+export interface EnrichedFleetStats {
+    windowStart:              number | null;
+    earliestSessionCreatedAt: number | null;
+    byAgent:                  EnrichedFleetAgentRow[];
+    totals:                   FleetStats["totals"];
 }
 
 // ─── Management Client ──────────────────────────────────────────
@@ -871,6 +909,43 @@ export class PilotSwarmManagementClient {
     async pruneDeletedSummaries(olderThan: Date): Promise<number> {
         this._ensureStarted();
         return this._catalog!.pruneDeletedSummaries(olderThan);
+    }
+
+    /**
+     * Fleet stats enriched with per-agent derived observability metrics:
+     * errorRate, avgTurnDurationMs, and estimatedCostUsd. Raw fields are
+     * identical to getFleetStats() — this is a superset, not a replacement.
+     */
+    async getFleetObservabilityStats(
+        opts?: { includeDeleted?: boolean; since?: Date },
+    ): Promise<EnrichedFleetStats> {
+        this._ensureStarted();
+        const raw = await this._catalog!.getFleetStats(opts);
+        const byAgent: EnrichedFleetAgentRow[] = raw.byAgent.map(agent => ({
+            ...agent,
+            errorRate: agent.totalTurnCount > 0
+                ? agent.totalErrorCount / agent.totalTurnCount
+                : null,
+            avgTurnDurationMs: agent.totalTurnCount > 0
+                ? Math.round(agent.totalTurnDurationMs / agent.totalTurnCount)
+                : null,
+            estimatedCostUsd: estimateCostUsd(
+                agent.totalTokensInput,
+                agent.totalTokensOutput,
+                agent.totalTokensCacheRead,
+                agent.totalTokensCacheWrite,
+                agent.model ?? "",
+            ),
+        }));
+        return { ...raw, byAgent };
+    }
+
+    /**
+     * Per-process snapshot of DB call counts, latencies, and errors.
+     * Counters reset on process restart — not fleet-wide aggregates.
+     */
+    getDbCallMetrics(): DbMetricsSnapshot {
+        return globalDbMetrics.snapshot();
     }
 
     /**
