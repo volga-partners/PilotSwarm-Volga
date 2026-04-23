@@ -547,6 +547,14 @@ export class NodeSdkTransport {
         return this.mgmt.pruneDeletedSummaries(olderThan);
     }
 
+    async getFleetObservabilityStats(opts) {
+        return this.mgmt.getFleetObservabilityStats(opts);
+    }
+
+    getDbCallMetrics() {
+        return this.mgmt.getDbCallMetrics();
+    }
+
     async getExecutionHistory(sessionId, executionId) {
         return this.mgmt.getExecutionHistory(sessionId, executionId);
     }

@@ -60,6 +60,11 @@ export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
             statements: queryPerformanceIndexStatements,
             transactional: false,
         },
+        {
+            version: "0009",
+            name: "monitoring_columns",
+            sql: migration_0009_monitoring_columns(schema),
+        },
     ];
 }
 
@@ -877,4 +882,170 @@ function migration_0008_session_indexes_for_tree_and_event_filters(schema: strin
         `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_${schema}_sessions_active
     ON ${s}.sessions(deleted_at) WHERE deleted_at IS NULL;`,
     ];
+}
+
+// ─── Migration 0009: Monitoring Columns ─────────────────────────
+
+function migration_0009_monitoring_columns(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+-- 0009_monitoring_columns: add per-session turn/error/tool counters and
+-- surface them in fleet aggregate procs.
+
+-- 1. New columns (idempotent with IF NOT EXISTS)
+ALTER TABLE ${s}.session_metric_summaries
+    ADD COLUMN IF NOT EXISTS turn_count              INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS error_count             INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS tool_call_count         INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS tool_error_count        INTEGER NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS total_turn_duration_ms  BIGINT  NOT NULL DEFAULT 0;
+
+-- 2. Extend upsert proc (VOID return — CREATE OR REPLACE is safe)
+CREATE OR REPLACE FUNCTION ${s}.cms_upsert_session_metric_summary(
+    p_session_id TEXT,
+    p_updates    JSONB
+) RETURNS VOID AS $$
+DECLARE
+    v_snapshot       BIGINT  := COALESCE((p_updates->>'snapshotSizeBytes')::BIGINT, 0);
+    v_dehydration    INT     := COALESCE((p_updates->>'dehydrationCountIncrement')::INT, 0);
+    v_hydration      INT     := COALESCE((p_updates->>'hydrationCountIncrement')::INT, 0);
+    v_lossy          INT     := COALESCE((p_updates->>'lossyHandoffCountIncrement')::INT, 0);
+    v_tokens_in      BIGINT  := COALESCE((p_updates->>'tokensInputIncrement')::BIGINT, 0);
+    v_tokens_out     BIGINT  := COALESCE((p_updates->>'tokensOutputIncrement')::BIGINT, 0);
+    v_tokens_cread   BIGINT  := COALESCE((p_updates->>'tokensCacheReadIncrement')::BIGINT, 0);
+    v_tokens_cwrite  BIGINT  := COALESCE((p_updates->>'tokensCacheWriteIncrement')::BIGINT, 0);
+    v_set_dehydrated BOOLEAN := COALESCE((p_updates->>'lastDehydratedAt')::BOOLEAN, FALSE);
+    v_set_hydrated   BOOLEAN := COALESCE((p_updates->>'lastHydratedAt')::BOOLEAN, FALSE);
+    v_set_checkpoint BOOLEAN := COALESCE((p_updates->>'lastCheckpointAt')::BOOLEAN, FALSE);
+    v_turn_count     INT     := COALESCE((p_updates->>'turnCountIncrement')::INT, 0);
+    v_error_count    INT     := COALESCE((p_updates->>'errorCountIncrement')::INT, 0);
+    v_tool_calls     INT     := COALESCE((p_updates->>'toolCallCountIncrement')::INT, 0);
+    v_tool_errors    INT     := COALESCE((p_updates->>'toolErrorCountIncrement')::INT, 0);
+    v_turn_ms        BIGINT  := COALESCE((p_updates->>'totalTurnDurationMsIncrement')::BIGINT, 0);
+BEGIN
+    INSERT INTO ${s}.session_metric_summaries (
+        session_id, snapshot_size_bytes,
+        dehydration_count, hydration_count, lossy_handoff_count,
+        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+        turn_count, error_count, tool_call_count, tool_error_count, total_turn_duration_ms
+    ) VALUES (
+        p_session_id, v_snapshot,
+        v_dehydration, v_hydration, v_lossy,
+        v_tokens_in, v_tokens_out, v_tokens_cread, v_tokens_cwrite,
+        v_turn_count, v_error_count, v_tool_calls, v_tool_errors, v_turn_ms
+    )
+    ON CONFLICT (session_id) DO UPDATE SET
+        snapshot_size_bytes    = CASE
+                                     WHEN p_updates ? 'snapshotSizeBytes'
+                                     THEN v_snapshot
+                                     ELSE ${s}.session_metric_summaries.snapshot_size_bytes
+                                 END,
+        dehydration_count      = ${s}.session_metric_summaries.dehydration_count      + v_dehydration,
+        hydration_count        = ${s}.session_metric_summaries.hydration_count        + v_hydration,
+        lossy_handoff_count    = ${s}.session_metric_summaries.lossy_handoff_count    + v_lossy,
+        tokens_input           = ${s}.session_metric_summaries.tokens_input           + v_tokens_in,
+        tokens_output          = ${s}.session_metric_summaries.tokens_output          + v_tokens_out,
+        tokens_cache_read      = ${s}.session_metric_summaries.tokens_cache_read      + v_tokens_cread,
+        tokens_cache_write     = ${s}.session_metric_summaries.tokens_cache_write     + v_tokens_cwrite,
+        last_dehydrated_at     = CASE WHEN v_set_dehydrated THEN now() ELSE ${s}.session_metric_summaries.last_dehydrated_at  END,
+        last_hydrated_at       = CASE WHEN v_set_hydrated   THEN now() ELSE ${s}.session_metric_summaries.last_hydrated_at    END,
+        last_checkpoint_at     = CASE WHEN v_set_checkpoint THEN now() ELSE ${s}.session_metric_summaries.last_checkpoint_at  END,
+        turn_count             = ${s}.session_metric_summaries.turn_count             + v_turn_count,
+        error_count            = ${s}.session_metric_summaries.error_count            + v_error_count,
+        tool_call_count        = ${s}.session_metric_summaries.tool_call_count        + v_tool_calls,
+        tool_error_count       = ${s}.session_metric_summaries.tool_error_count       + v_tool_errors,
+        total_turn_duration_ms = ${s}.session_metric_summaries.total_turn_duration_ms + v_turn_ms,
+        updated_at             = now();
+END;
+$$ LANGUAGE plpgsql;
+
+-- 3. Fleet stats by agent (DROP + CREATE: RETURNS TABLE shape changes)
+DROP FUNCTION IF EXISTS ${s}.cms_get_fleet_stats_by_agent(BOOLEAN, TIMESTAMPTZ);
+CREATE FUNCTION ${s}.cms_get_fleet_stats_by_agent(
+    p_include_deleted BOOLEAN,
+    p_since           TIMESTAMPTZ
+) RETURNS TABLE (
+    agent_id                   TEXT,
+    model                      TEXT,
+    session_count              INT,
+    total_snapshot_size_bytes  BIGINT,
+    total_dehydration_count    INT,
+    total_hydration_count      INT,
+    total_lossy_handoff_count  INT,
+    total_tokens_input         BIGINT,
+    total_tokens_output        BIGINT,
+    total_tokens_cache_read    BIGINT,
+    total_tokens_cache_write   BIGINT,
+    total_turn_count           BIGINT,
+    total_error_count          BIGINT,
+    total_tool_call_count      BIGINT,
+    total_tool_error_count     BIGINT,
+    total_turn_duration_ms     BIGINT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        m.agent_id,
+        m.model,
+        COUNT(*)::int                                           AS session_count,
+        COALESCE(SUM(m.snapshot_size_bytes), 0)::bigint         AS total_snapshot_size_bytes,
+        COALESCE(SUM(m.dehydration_count), 0)::int              AS total_dehydration_count,
+        COALESCE(SUM(m.hydration_count), 0)::int                AS total_hydration_count,
+        COALESCE(SUM(m.lossy_handoff_count), 0)::int            AS total_lossy_handoff_count,
+        COALESCE(SUM(m.tokens_input), 0)::bigint                AS total_tokens_input,
+        COALESCE(SUM(m.tokens_output), 0)::bigint               AS total_tokens_output,
+        COALESCE(SUM(m.tokens_cache_read), 0)::bigint           AS total_tokens_cache_read,
+        COALESCE(SUM(m.tokens_cache_write), 0)::bigint          AS total_tokens_cache_write,
+        COALESCE(SUM(m.turn_count), 0)::bigint                  AS total_turn_count,
+        COALESCE(SUM(m.error_count), 0)::bigint                 AS total_error_count,
+        COALESCE(SUM(m.tool_call_count), 0)::bigint             AS total_tool_call_count,
+        COALESCE(SUM(m.tool_error_count), 0)::bigint            AS total_tool_error_count,
+        COALESCE(SUM(m.total_turn_duration_ms), 0)::bigint      AS total_turn_duration_ms
+    FROM ${s}.session_metric_summaries m
+    WHERE (p_include_deleted OR m.deleted_at IS NULL)
+      AND (p_since IS NULL OR m.created_at >= p_since)
+    GROUP BY m.agent_id, m.model;
+END;
+$$ LANGUAGE plpgsql;
+
+-- 4. Fleet stats totals (DROP + CREATE: RETURNS TABLE shape changes)
+DROP FUNCTION IF EXISTS ${s}.cms_get_fleet_stats_totals(BOOLEAN, TIMESTAMPTZ);
+CREATE FUNCTION ${s}.cms_get_fleet_stats_totals(
+    p_include_deleted BOOLEAN,
+    p_since           TIMESTAMPTZ
+) RETURNS TABLE (
+    session_count                INT,
+    total_snapshot_size_bytes    BIGINT,
+    total_tokens_input           BIGINT,
+    total_tokens_output          BIGINT,
+    total_tokens_cache_read      BIGINT,
+    total_tokens_cache_write     BIGINT,
+    earliest_session_created_at  TIMESTAMPTZ,
+    total_turn_count             BIGINT,
+    total_error_count            BIGINT,
+    total_tool_call_count        BIGINT,
+    total_tool_error_count       BIGINT,
+    total_turn_duration_ms       BIGINT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        COUNT(*)::int                                           AS session_count,
+        COALESCE(SUM(m.snapshot_size_bytes), 0)::bigint         AS total_snapshot_size_bytes,
+        COALESCE(SUM(m.tokens_input), 0)::bigint                AS total_tokens_input,
+        COALESCE(SUM(m.tokens_output), 0)::bigint               AS total_tokens_output,
+        COALESCE(SUM(m.tokens_cache_read), 0)::bigint           AS total_tokens_cache_read,
+        COALESCE(SUM(m.tokens_cache_write), 0)::bigint          AS total_tokens_cache_write,
+        MIN(m.created_at)                                       AS earliest_session_created_at,
+        COALESCE(SUM(m.turn_count), 0)::bigint                  AS total_turn_count,
+        COALESCE(SUM(m.error_count), 0)::bigint                 AS total_error_count,
+        COALESCE(SUM(m.tool_call_count), 0)::bigint             AS total_tool_call_count,
+        COALESCE(SUM(m.tool_error_count), 0)::bigint            AS total_tool_error_count,
+        COALESCE(SUM(m.total_turn_duration_ms), 0)::bigint      AS total_turn_duration_ms
+    FROM ${s}.session_metric_summaries m
+    WHERE (p_include_deleted OR m.deleted_at IS NULL)
+      AND (p_since IS NULL OR m.created_at >= p_since);
+END;
+$$ LANGUAGE plpgsql;
+`;
 }

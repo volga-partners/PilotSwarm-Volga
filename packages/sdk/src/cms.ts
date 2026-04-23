@@ -9,6 +9,7 @@
  */
 
 import { runCmsMigrations } from "./cms-migrator.js";
+import { globalDbMetrics } from "./db-metrics.js";
 
 // ─── Types ───────────────────────────────────────────────────────
 
@@ -85,6 +86,11 @@ export interface SessionMetricSummary {
     tokensCacheWrite: number;
     /** Cached-prompt hit ratio (0..1), null when tokensInput is 0. Derived. */
     cacheHitRatio: number | null;
+    turnCount: number;
+    errorCount: number;
+    toolCallCount: number;
+    toolErrorCount: number;
+    totalTurnDurationMs: number;
     deletedAt: number | null;
     createdAt: number;
     updatedAt: number;
@@ -103,6 +109,11 @@ export interface SessionMetricSummaryUpsert {
     tokensOutputIncrement?: number;
     tokensCacheReadIncrement?: number;
     tokensCacheWriteIncrement?: number;
+    turnCountIncrement?: number;
+    errorCountIncrement?: number;
+    toolCallCountIncrement?: number;
+    toolErrorCountIncrement?: number;
+    totalTurnDurationMsIncrement?: number;
 }
 
 /** Fleet-wide aggregate stats. */
@@ -123,6 +134,11 @@ export interface FleetStats {
         totalTokensCacheWrite: number;
         /** Derived: cache_read / input. Null when input is 0. */
         cacheHitRatio: number | null;
+        totalTurnCount: number;
+        totalErrorCount: number;
+        totalToolCallCount: number;
+        totalToolErrorCount: number;
+        totalTurnDurationMs: number;
     }>;
     totals: {
         sessionCount: number;
@@ -132,6 +148,11 @@ export interface FleetStats {
         totalTokensCacheRead: number;
         totalTokensCacheWrite: number;
         cacheHitRatio: number | null;
+        totalTurnCount: number;
+        totalErrorCount: number;
+        totalToolCallCount: number;
+        totalToolErrorCount: number;
+        totalTurnDurationMs: number;
     };
 }
 
@@ -374,6 +395,18 @@ function sqlForSchema(schema: string) {
     };
 }
 
+async function measureDbCall<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const t0 = Date.now();
+    try {
+        const result = await fn();
+        globalDbMetrics.record(key, Date.now() - t0);
+        return result;
+    } catch (err) {
+        globalDbMetrics.record(key, Date.now() - t0, true);
+        throw err;
+    }
+}
+
 /**
  * PgSessionCatalogProvider — PostgreSQL implementation of SessionCatalogProvider.
  *
@@ -411,17 +444,21 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
 
     async initialize(): Promise<void> {
         if (this.initialized) return;
-        await runCmsMigrations(this.pool, this.sql.schema);
-        this.initialized = true;
+        return measureDbCall("cms.initialize", async () => {
+            await runCmsMigrations(this.pool, this.sql.schema);
+            this.initialized = true;
+        });
     }
 
     // ── Writes ───────────────────────────────────────────────
 
     async createSession(sessionId: string, opts?: { model?: string; parentSessionId?: string; isSystem?: boolean; agentId?: string; splash?: string }): Promise<void> {
-        await this.pool.query(
-            `SELECT ${this.sql.fn.createSession}($1, $2, $3, $4, $5, $6)`,
-            [sessionId, opts?.model ?? null, opts?.parentSessionId ?? null, opts?.isSystem ?? false, opts?.agentId ?? null, opts?.splash ?? null],
-        );
+        return measureDbCall("cms.createSession", async () => {
+            await this.pool.query(
+                `SELECT ${this.sql.fn.createSession}($1, $2, $3, $4, $5, $6)`,
+                [sessionId, opts?.model ?? null, opts?.parentSessionId ?? null, opts?.isSystem ?? false, opts?.agentId ?? null, opts?.splash ?? null],
+            );
+        });
     }
 
     async updateSession(sessionId: string, updates: SessionRowUpdates): Promise<void> {
@@ -441,114 +478,135 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
 
         if (Object.keys(jsonUpdates).length === 0) return;
 
-        await this.pool.query(
-            `SELECT ${this.sql.fn.updateSession}($1, $2)`,
-            [sessionId, JSON.stringify(jsonUpdates)],
-        );
+        return measureDbCall("cms.updateSession", async () => {
+            await this.pool.query(
+                `SELECT ${this.sql.fn.updateSession}($1, $2)`,
+                [sessionId, JSON.stringify(jsonUpdates)],
+            );
+        });
     }
 
     async softDeleteSession(sessionId: string): Promise<void> {
-        try {
-            await this.pool.query(
-                `SELECT ${this.sql.fn.softDeleteSession}($1)`,
-                [sessionId],
-            );
-        } catch (err: any) {
-            if (err?.message?.includes("Cannot delete system session")) {
-                throw new Error("Cannot delete system session");
+        return measureDbCall("cms.softDeleteSession", async () => {
+            try {
+                await this.pool.query(
+                    `SELECT ${this.sql.fn.softDeleteSession}($1)`,
+                    [sessionId],
+                );
+            } catch (err: any) {
+                if (err?.message?.includes("Cannot delete system session")) {
+                    throw new Error("Cannot delete system session");
+                }
+                throw err;
             }
-            throw err;
-        }
+        });
     }
 
     // ── Reads ────────────────────────────────────────────────
 
     async listSessions(): Promise<SessionRow[]> {
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.listSessions}()`,
-        );
-        return rows.map(rowToSessionRow);
+        return measureDbCall("cms.listSessions", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.listSessions}()`,
+            );
+            return rows.map(rowToSessionRow);
+        });
     }
 
     async getSession(sessionId: string): Promise<SessionRow | null> {
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getSession}($1)`,
-            [sessionId],
-        );
-        return rows.length > 0 ? rowToSessionRow(rows[0]) : null;
+        return measureDbCall("cms.getSession", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getSession}($1)`,
+                [sessionId],
+            );
+            return rows.length > 0 ? rowToSessionRow(rows[0]) : null;
+        });
     }
 
     async getDescendantSessionIds(sessionId: string): Promise<string[]> {
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getDescendantSessionIds}($1)`,
-            [sessionId],
-        );
-        return rows.map((r: any) => r.session_id);
+        return measureDbCall("cms.getDescendantSessionIds", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getDescendantSessionIds}($1)`,
+                [sessionId],
+            );
+            return rows.map((r: any) => r.session_id);
+        });
     }
 
     async getLastSessionId(): Promise<string | null> {
-        const { rows } = await this.pool.query(
-            `SELECT ${this.sql.fn.getLastSessionId}() AS session_id`,
-        );
-        return rows.length > 0 ? rows[0].session_id : null;
+        return measureDbCall("cms.getLastSessionId", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT ${this.sql.fn.getLastSessionId}() AS session_id`,
+            );
+            return rows.length > 0 ? rows[0].session_id : null;
+        });
     }
 
     // ── Events ───────────────────────────────────────────────
 
     async recordEvents(sessionId: string, events: { eventType: string; data: unknown }[], workerNodeId?: string): Promise<void> {
         if (events.length === 0) return;
-        const client = await this.pool.connect();
-        try {
-            await client.query("BEGIN");
-
-            await client.query(
-                `SELECT ${this.sql.fn.recordEvents}($1, $2, $3)`,
-                [sessionId, JSON.stringify(events), workerNodeId ?? null],
-            );
-            await client.query(
-                "SELECT pg_notify($1, $2)",
-                [SESSION_EVENTS_NOTIFY_CHANNEL, JSON.stringify({ sessionId })],
-            );
-            await client.query("COMMIT");
-        } catch (err) {
+        return measureDbCall("cms.recordEvents", async () => {
+            const client = await this.pool.connect();
             try {
-                await client.query("ROLLBACK");
-            } catch {}
-            throw err;
-        } finally {
-            client.release();
-        }
+                await client.query("BEGIN");
+
+                await client.query(
+                    `SELECT ${this.sql.fn.recordEvents}($1, $2, $3)`,
+                    [sessionId, JSON.stringify(events), workerNodeId ?? null],
+                );
+                await client.query(
+                    "SELECT pg_notify($1, $2)",
+                    [SESSION_EVENTS_NOTIFY_CHANNEL, JSON.stringify({ sessionId })],
+                );
+                await client.query("COMMIT");
+            } catch (err) {
+                try {
+                    await client.query("ROLLBACK");
+                } catch {}
+                throw err;
+            } finally {
+                client.release();
+            }
+        });
     }
 
     async getSessionEvents(sessionId: string, afterSeq?: number, limit?: number): Promise<SessionEvent[]> {
-        const effectiveLimit = limit ?? DEFAULT_EVENT_FETCH_LIMIT;
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getSessionEvents}($1, $2, $3)`,
-            [sessionId, afterSeq ?? null, effectiveLimit],
-        );
-        return rows.map(rowToSessionEvent);
+        return measureDbCall("cms.getSessionEvents", async () => {
+            const effectiveLimit = limit ?? DEFAULT_EVENT_FETCH_LIMIT;
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getSessionEvents}($1, $2, $3)`,
+                [sessionId, afterSeq ?? null, effectiveLimit],
+            );
+            return rows.map(rowToSessionEvent);
+        });
     }
 
     async getSessionEventsBefore(sessionId: string, beforeSeq: number, limit?: number): Promise<SessionEvent[]> {
-        const effectiveLimit = limit ?? DEFAULT_EVENT_FETCH_LIMIT;
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getSessionEventsBefore}($1, $2, $3)`,
-            [sessionId, beforeSeq, effectiveLimit],
-        );
-        return rows.map(rowToSessionEvent);
+        return measureDbCall("cms.getSessionEventsBefore", async () => {
+            const effectiveLimit = limit ?? DEFAULT_EVENT_FETCH_LIMIT;
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getSessionEventsBefore}($1, $2, $3)`,
+                [sessionId, beforeSeq, effectiveLimit],
+            );
+            return rows.map(rowToSessionEvent);
+        });
     }
 
     // ── Session Metric Summaries ─────────────────────────────
 
     async getSessionMetricSummary(sessionId: string): Promise<SessionMetricSummary | null> {
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getSessionMetricSummary}($1)`,
-            [sessionId],
-        );
-        return rows.length > 0 ? rowToSessionMetricSummary(rows[0]) : null;
+        return measureDbCall("cms.getSessionMetricSummary", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getSessionMetricSummary}($1)`,
+                [sessionId],
+            );
+            return rows.length > 0 ? rowToSessionMetricSummary(rows[0]) : null;
+        });
     }
 
     async getSessionTreeStats(sessionId: string): Promise<SessionTreeStats | null> {
+        return measureDbCall("cms.getSessionTreeStats", async () => {
         const self = await this.getSessionMetricSummary(sessionId);
         if (!self) return null;
 
@@ -597,9 +655,11 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
             },
             byModel,
         };
+        });
     }
 
     async getFleetStats(opts?: { includeDeleted?: boolean; since?: Date }): Promise<FleetStats> {
+        return measureDbCall("cms.getFleetStats", async () => {
         const includeDeleted = opts?.includeDeleted ?? false;
         const since = opts?.since ?? null;
 
@@ -639,6 +699,11 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
                     totalTokensCacheRead: tokensCacheRead,
                     totalTokensCacheWrite: Number(g.total_tokens_cache_write) || 0,
                     cacheHitRatio: computeCacheHitRatio(tokensInput, tokensCacheRead),
+                    totalTurnCount: Number(g.total_turn_count) || 0,
+                    totalErrorCount: Number(g.total_error_count) || 0,
+                    totalToolCallCount: Number(g.total_tool_call_count) || 0,
+                    totalToolErrorCount: Number(g.total_tool_error_count) || 0,
+                    totalTurnDurationMs: Number(g.total_turn_duration_ms) || 0,
                 };
             }),
             totals: {
@@ -649,34 +714,47 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
                 totalTokensCacheRead: totalsTokensCacheRead,
                 totalTokensCacheWrite: Number(t.total_tokens_cache_write) || 0,
                 cacheHitRatio: computeCacheHitRatio(totalsTokensInput, totalsTokensCacheRead),
+                totalTurnCount: Number(t.total_turn_count) || 0,
+                totalErrorCount: Number(t.total_error_count) || 0,
+                totalToolCallCount: Number(t.total_tool_call_count) || 0,
+                totalToolErrorCount: Number(t.total_tool_error_count) || 0,
+                totalTurnDurationMs: Number(t.total_turn_duration_ms) || 0,
             },
         };
+        });
     }
 
     async upsertSessionMetricSummary(sessionId: string, updates: SessionMetricSummaryUpsert): Promise<void> {
-        await this.pool.query(
-            `SELECT ${this.sql.fn.upsertSessionMetricSummary}($1, $2)`,
-            [sessionId, JSON.stringify(updates)],
-        );
+        return measureDbCall("cms.upsertSessionMetricSummary", async () => {
+            await this.pool.query(
+                `SELECT ${this.sql.fn.upsertSessionMetricSummary}($1, $2)`,
+                [sessionId, JSON.stringify(updates)],
+            );
+        });
     }
 
     async pruneDeletedSummaries(olderThan: Date): Promise<number> {
-        const { rows } = await this.pool.query(
-            `SELECT ${this.sql.fn.pruneDeletedSummaries}($1) AS deleted_count`,
-            [olderThan],
-        );
-        return Number(rows[0]?.deleted_count) || 0;
+        return measureDbCall("cms.pruneDeletedSummaries", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT ${this.sql.fn.pruneDeletedSummaries}($1) AS deleted_count`,
+                [olderThan],
+            );
+            return Number(rows[0]?.deleted_count) || 0;
+        });
     }
 
     async getSessionSkillUsage(sessionId: string, opts?: { since?: Date }): Promise<SkillUsageRow[]> {
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getSessionSkillUsage}($1, $2)`,
-            [sessionId, opts?.since ?? null],
-        );
-        return rows.map(rowToSkillUsageRow);
+        return measureDbCall("cms.getSessionSkillUsage", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getSessionSkillUsage}($1, $2)`,
+                [sessionId, opts?.since ?? null],
+            );
+            return rows.map(rowToSkillUsageRow);
+        });
     }
 
     async getSessionTreeSkillUsage(sessionId: string, opts?: { since?: Date }): Promise<SessionTreeSkillUsage> {
+        return measureDbCall("cms.getSessionTreeSkillUsage", async () => {
         const { rows } = await this.pool.query(
             `SELECT * FROM ${this.sql.fn.getSessionTreeSkillUsage}($1, $2)`,
             [sessionId, opts?.since ?? null],
@@ -722,23 +800,26 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
             rolledUp,
             totalInvocations,
         };
+        });
     }
 
     async getFleetSkillUsage(opts?: { since?: Date; includeDeleted?: boolean }): Promise<FleetSkillUsage> {
-        const since = opts?.since ?? null;
-        const includeDeleted = opts?.includeDeleted ?? false;
-        const { rows } = await this.pool.query(
-            `SELECT * FROM ${this.sql.fn.getFleetSkillUsage}($1, $2)`,
-            [since, includeDeleted],
-        );
-        return {
-            windowStart: opts?.since ? opts.since.getTime() : null,
-            rows: rows.map((r: any): FleetSkillUsageRow => ({
-                ...rowToSkillUsageRow(r),
-                agentId: r.agent_id ?? null,
-                sessionCount: Number(r.session_count) || 0,
-            })),
-        };
+        return measureDbCall("cms.getFleetSkillUsage", async () => {
+            const since = opts?.since ?? null;
+            const includeDeleted = opts?.includeDeleted ?? false;
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getFleetSkillUsage}($1, $2)`,
+                [since, includeDeleted],
+            );
+            return {
+                windowStart: opts?.since ? opts.since.getTime() : null,
+                rows: rows.map((r: any): FleetSkillUsageRow => ({
+                    ...rowToSkillUsageRow(r),
+                    agentId: r.agent_id ?? null,
+                    sessionCount: Number(r.session_count) || 0,
+                })),
+            };
+        });
     }
 
     async close(): Promise<void> {
@@ -807,6 +888,11 @@ function rowToSessionMetricSummary(row: any): SessionMetricSummary {
         tokensCacheRead,
         tokensCacheWrite: Number(row.tokens_cache_write) || 0,
         cacheHitRatio: computeCacheHitRatio(tokensInput, tokensCacheRead),
+        turnCount: Number(row.turn_count) || 0,
+        errorCount: Number(row.error_count) || 0,
+        toolCallCount: Number(row.tool_call_count) || 0,
+        toolErrorCount: Number(row.tool_error_count) || 0,
+        totalTurnDurationMs: Number(row.total_turn_duration_ms) || 0,
         deletedAt: row.deleted_at ? new Date(row.deleted_at).getTime() : null,
         createdAt: new Date(row.created_at).getTime(),
         updatedAt: new Date(row.updated_at).getTime(),

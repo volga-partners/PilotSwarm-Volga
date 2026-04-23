@@ -512,6 +512,7 @@ export function registerActivities(
         const trace = activityTrace(activityCtx, "runTurn");
 
         const failForMissingState = async (message: string) => {
+            flushTurnSummaryMetrics("error");
             await flushBufferedEvents();
             if (catalog) {
                 await catalog.updateSession(input.sessionId, {
@@ -542,6 +543,41 @@ export function registerActivities(
             await catalog.recordEvents(input.sessionId, pendingEvents, workerNodeId).catch((err: any) => {
                 activityCtx.traceInfo(`[runTurn] CMS recordEvents batch failed: ${err}`);
             });
+        };
+
+        // Turn-local accumulator — flushed once at every terminal return path
+        const turnStartedAt = Date.now();
+        let toolCallCounter  = 0;
+        let toolErrorCounter = 0;
+        let accTokensInput      = 0;
+        let accTokensOutput     = 0;
+        let accTokensCacheRead  = 0;
+        let accTokensCacheWrite = 0;
+        let turnSummaryFlushed  = false;
+
+        const flushTurnSummaryMetrics = (finalResultType: string | null) => {
+            if (turnSummaryFlushed || !catalog) return;
+            turnSummaryFlushed = true;
+            const durationMs = Date.now() - turnStartedAt;
+            catalog.upsertSessionMetricSummary(input.sessionId, {
+                ...(accTokensInput      > 0 ? { tokensInputIncrement:      accTokensInput      } : {}),
+                ...(accTokensOutput     > 0 ? { tokensOutputIncrement:     accTokensOutput     } : {}),
+                ...(accTokensCacheRead  > 0 ? { tokensCacheReadIncrement:  accTokensCacheRead  } : {}),
+                ...(accTokensCacheWrite > 0 ? { tokensCacheWriteIncrement: accTokensCacheWrite } : {}),
+                turnCountIncrement:           1,
+                errorCountIncrement:          finalResultType === "error" ? 1 : 0,
+                toolCallCountIncrement:       toolCallCounter,
+                toolErrorCountIncrement:      toolErrorCounter,
+                totalTurnDurationMsIncrement: durationMs,
+            }).catch((err: any) => {
+                activityCtx.traceInfo(`[runTurn] CMS turn summary flush failed: ${err}`);
+            });
+        };
+
+        const finalizeTurn = async (result: TurnResult): Promise<TurnResult> => {
+            flushTurnSummaryMetrics(result.type ?? null);
+            await flushBufferedEvents();
+            return result;
         };
 
         let session: any = null;
@@ -1025,10 +1061,17 @@ export function registerActivities(
                     if (event.eventType === "assistant.usage") {
                         const usageUpsert = buildUsageSummaryUpsert(event.data);
                         if (usageUpsert) {
-                            catalog.upsertSessionMetricSummary(input.sessionId, usageUpsert).catch((err: any) => {
-                                activityCtx.traceInfo(`[runTurn] CMS assistant.usage summary update failed: ${err}`);
-                            });
+                            accTokensInput      += usageUpsert.tokensInputIncrement      ?? 0;
+                            accTokensOutput     += usageUpsert.tokensOutputIncrement     ?? 0;
+                            accTokensCacheRead  += usageUpsert.tokensCacheReadIncrement  ?? 0;
+                            accTokensCacheWrite += usageUpsert.tokensCacheWriteIncrement ?? 0;
                         }
+                    }
+                    if (event.eventType === "assistant.function_call") {
+                        toolCallCounter++;
+                    }
+                    if (event.eventType === "tool_result" && (event.data as any)?.isError === true) {
+                        toolErrorCounter++;
                     }
                     bufferCmsEvent(event.eventType, event.data);
                 }
@@ -1126,8 +1169,7 @@ export function registerActivities(
                 if (promptGuardrail.action === "block") {
                     const refusal = buildPromptGuardrailRefusal(promptGuardrail);
                     bufferCmsEvent("assistant.message", { content: refusal });
-                    await flushBufferedEvents();
-                    return {
+                    return await finalizeTurn({
                         type: "completed",
                         content: refusal,
                         events: [
@@ -1135,7 +1177,7 @@ export function registerActivities(
                             { eventType: "assistant.message", data: { content: refusal } },
                         ],
                         promptGuardrail,
-                    };
+                    });
                 }
             }
 
@@ -1253,7 +1295,7 @@ export function registerActivities(
                     const fatalMessage =
                         `Live Copilot transcript became inconsistent for ${input.sessionId}, and fresh-session recovery failed. ${recoveryMessage}`;
                     activityCtx.traceInfo(`[runTurn] unrecoverable corrupted transcript for ${input.sessionId}: ${fatalMessage}`);
-                    return { type: "error", message: fatalMessage } as TurnResult;
+                    return await finalizeTurn({ type: "error", message: fatalMessage } as TurnResult);
                 }
 
                 const recoveredPrompt = mergePromptSections([CORRUPTED_TRANSCRIPT_REPLAY_NOTICE, guardedPrompt]) || guardedPrompt;
@@ -1287,8 +1329,7 @@ export function registerActivities(
             }
 
             if (cancelled) {
-                await flushBufferedEvents();
-                return { type: "cancelled" };
+                return await finalizeTurn({ type: "cancelled" });
             }
 
             // ── Activity-level writeback: sync turn result → CMS ──
@@ -1336,8 +1377,7 @@ export function registerActivities(
 
             // ── Post-turn guardrail enforcement ──
             if (!promptGuardrail) {
-                await flushBufferedEvents();
-                return result;
+                return await finalizeTurn(result);
             }
 
             result.promptGuardrail = promptGuardrail;
@@ -1351,8 +1391,7 @@ export function registerActivities(
                 const refusal = buildPromptGuardrailRefusal(promptGuardrail);
                 bufferCmsEvent("guardrail.authority_claim_blocked", { decision: promptGuardrail });
                 bufferCmsEvent("assistant.message", { content: refusal });
-                await flushBufferedEvents();
-                return {
+                return await finalizeTurn({
                     type: "completed",
                     content: refusal,
                     events: [
@@ -1360,7 +1399,7 @@ export function registerActivities(
                         { eventType: "assistant.message", data: { content: refusal } },
                     ],
                     promptGuardrail,
-                };
+                });
             }
 
             if (promptGuardrail.action === "allow_guarded" && isHighRiskTurnResult(result)) {
@@ -1368,8 +1407,7 @@ export function registerActivities(
                 const refusal = buildPromptGuardrailRefusal(promptGuardrail);
                 bufferCmsEvent("guardrail.action_blocked", { decision: promptGuardrail, blockedResultType: result.type });
                 bufferCmsEvent("assistant.message", { content: refusal });
-                await flushBufferedEvents();
-                return {
+                return await finalizeTurn({
                     type: "completed",
                     content: refusal,
                     events: [
@@ -1377,12 +1415,12 @@ export function registerActivities(
                         { eventType: "assistant.message", data: { content: refusal } },
                     ],
                     promptGuardrail,
-                };
+                });
             }
 
-            await flushBufferedEvents();
-            return result;
+            return await finalizeTurn(result);
         } finally {
+            flushTurnSummaryMetrics("error"); // no-op if already flushed; counts unhandled throws as errors
             await flushBufferedEvents();
             clearInterval(cancelPoll);
             const clientToStop: PilotSwarmClient | null = inlineSdkClient;
