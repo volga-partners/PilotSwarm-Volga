@@ -271,6 +271,42 @@ export class BrowserPortalTransport {
         return this.rpc("getDbCallMetrics", {});
     }
 
+    async getSessionTurnMetrics(sessionId, opts) {
+        return this.rpc("getSessionTurnMetrics", {
+            sessionId,
+            since: opts?.since instanceof Date ? opts.since.toISOString() : opts?.since,
+            limit: opts?.limit,
+        });
+    }
+
+    async getFleetTurnAnalytics(opts) {
+        return this.rpc("getFleetTurnAnalytics", {
+            since: opts?.since instanceof Date ? opts.since.toISOString() : opts?.since,
+            agentId: opts?.agentId,
+            model: opts?.model,
+        });
+    }
+
+    async getHourlyTokenBuckets(since, opts) {
+        return this.rpc("getHourlyTokenBuckets", {
+            since: since instanceof Date ? since.toISOString() : since,
+            agentId: opts?.agentId,
+            model: opts?.model,
+        });
+    }
+
+    async getFleetDbCallMetrics(opts) {
+        return this.rpc("getFleetDbCallMetrics", {
+            since: opts?.since instanceof Date ? opts.since.toISOString() : opts?.since,
+        });
+    }
+
+    async pruneTurnMetrics(olderThan) {
+        return this.rpc("pruneTurnMetrics", {
+            olderThan: olderThan instanceof Date ? olderThan.toISOString() : olderThan,
+        });
+    }
+
     async getExecutionHistory(sessionId, executionId) {
         return this.rpc("getExecutionHistory", { sessionId, executionId });
     }

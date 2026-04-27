@@ -65,6 +65,11 @@ export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
             name: "monitoring_columns",
             sql: migration_0009_monitoring_columns(schema),
         },
+        {
+            version: "0010",
+            name: "turn_metrics_and_db_buckets",
+            sql: migration_0010_turn_metrics_and_db_buckets(schema),
+        },
     ];
 }
 
@@ -1045,6 +1050,348 @@ BEGIN
     FROM ${s}.session_metric_summaries m
     WHERE (p_include_deleted OR m.deleted_at IS NULL)
       AND (p_since IS NULL OR m.created_at >= p_since);
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0010: Turn Metrics + DB Call Buckets ─────────────
+
+function migration_0010_turn_metrics_and_db_buckets(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+-- 0010_turn_metrics_and_db_buckets: per-turn analytics table, hourly token
+-- buckets, and per-minute per-process DB call metric buckets.
+
+-- ── 1. session_turn_metrics ──────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ${s}.session_turn_metrics (
+    id                  BIGSERIAL PRIMARY KEY,
+    session_id          TEXT          NOT NULL,
+    agent_id            TEXT,
+    model               TEXT,
+    turn_index          INTEGER       NOT NULL,
+    started_at          TIMESTAMPTZ   NOT NULL,
+    ended_at            TIMESTAMPTZ   NOT NULL,
+    duration_ms         INTEGER       NOT NULL CHECK (duration_ms >= 0),
+    tokens_input        BIGINT        NOT NULL DEFAULT 0,
+    tokens_output       BIGINT        NOT NULL DEFAULT 0,
+    tokens_cache_read   BIGINT        NOT NULL DEFAULT 0,
+    tokens_cache_write  BIGINT        NOT NULL DEFAULT 0,
+    tool_calls          INTEGER       NOT NULL DEFAULT 0,
+    tool_errors         INTEGER       NOT NULL DEFAULT 0,
+    result_type         TEXT,
+    error_message       TEXT,
+    worker_node_id      TEXT,
+    created_at          TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    CHECK (ended_at >= started_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_${schema}_turn_metrics_session_idx
+    ON ${s}.session_turn_metrics(session_id, turn_index DESC);
+CREATE INDEX IF NOT EXISTS idx_${schema}_turn_metrics_started
+    ON ${s}.session_turn_metrics(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_${schema}_turn_metrics_agent_started
+    ON ${s}.session_turn_metrics(agent_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_${schema}_turn_metrics_model_started
+    ON ${s}.session_turn_metrics(model, started_at DESC);
+
+-- ── 2. db_call_metric_buckets ────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS ${s}.db_call_metric_buckets (
+    bucket_minute   TIMESTAMPTZ   NOT NULL,
+    process_id      TEXT          NOT NULL,
+    process_role    TEXT          NOT NULL DEFAULT 'unknown',
+    method          TEXT          NOT NULL,
+    calls           BIGINT        NOT NULL DEFAULT 0,
+    errors          BIGINT        NOT NULL DEFAULT 0,
+    total_ms        BIGINT        NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    PRIMARY KEY (bucket_minute, process_id, method)
+);
+
+CREATE INDEX IF NOT EXISTS idx_${schema}_db_buckets_minute
+    ON ${s}.db_call_metric_buckets(bucket_minute DESC);
+CREATE INDEX IF NOT EXISTS idx_${schema}_db_buckets_method_minute
+    ON ${s}.db_call_metric_buckets(method, bucket_minute DESC);
+
+-- ── 3. cms_insert_turn_metric ────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION ${s}.cms_insert_turn_metric(
+    p_session_id         TEXT,
+    p_agent_id           TEXT,
+    p_model              TEXT,
+    p_turn_index         INTEGER,
+    p_started_at         TIMESTAMPTZ,
+    p_ended_at           TIMESTAMPTZ,
+    p_duration_ms        INTEGER,
+    p_tokens_input       BIGINT,
+    p_tokens_output      BIGINT,
+    p_tokens_cache_read  BIGINT,
+    p_tokens_cache_write BIGINT,
+    p_tool_calls         INTEGER,
+    p_tool_errors        INTEGER,
+    p_result_type        TEXT,
+    p_error_message      TEXT,
+    p_worker_node_id     TEXT
+) RETURNS VOID AS $$
+BEGIN
+    INSERT INTO ${s}.session_turn_metrics (
+        session_id, agent_id, model, turn_index,
+        started_at, ended_at, duration_ms,
+        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write,
+        tool_calls, tool_errors, result_type, error_message, worker_node_id
+    ) VALUES (
+        p_session_id, p_agent_id, p_model, p_turn_index,
+        p_started_at, p_ended_at, p_duration_ms,
+        p_tokens_input, p_tokens_output, p_tokens_cache_read, p_tokens_cache_write,
+        p_tool_calls, p_tool_errors, p_result_type, p_error_message, p_worker_node_id
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 4. cms_get_session_turn_metrics ─────────────────────────────
+
+CREATE OR REPLACE FUNCTION ${s}.cms_get_session_turn_metrics(
+    p_session_id TEXT,
+    p_since      TIMESTAMPTZ DEFAULT NULL,
+    p_limit      INT         DEFAULT 200
+) RETURNS TABLE (
+    id                  BIGINT,
+    session_id          TEXT,
+    agent_id            TEXT,
+    model               TEXT,
+    turn_index          INT,
+    started_at          TIMESTAMPTZ,
+    ended_at            TIMESTAMPTZ,
+    duration_ms         INT,
+    tokens_input        BIGINT,
+    tokens_output       BIGINT,
+    tokens_cache_read   BIGINT,
+    tokens_cache_write  BIGINT,
+    tool_calls          INT,
+    tool_errors         INT,
+    result_type         TEXT,
+    error_message       TEXT,
+    worker_node_id      TEXT,
+    created_at          TIMESTAMPTZ
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        t.id, t.session_id, t.agent_id, t.model, t.turn_index,
+        t.started_at, t.ended_at, t.duration_ms,
+        t.tokens_input, t.tokens_output, t.tokens_cache_read, t.tokens_cache_write,
+        t.tool_calls, t.tool_errors, t.result_type, t.error_message,
+        t.worker_node_id, t.created_at
+    FROM ${s}.session_turn_metrics t
+    WHERE t.session_id = p_session_id
+      AND (p_since IS NULL OR t.started_at >= p_since)
+    ORDER BY t.turn_index DESC, t.id DESC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 5. cms_get_fleet_turn_analytics ─────────────────────────────
+
+CREATE OR REPLACE FUNCTION ${s}.cms_get_fleet_turn_analytics(
+    p_since    TIMESTAMPTZ DEFAULT NULL,
+    p_agent_id TEXT        DEFAULT NULL,
+    p_model    TEXT        DEFAULT NULL
+) RETURNS TABLE (
+    agent_id                 TEXT,
+    model                    TEXT,
+    turn_count               BIGINT,
+    error_count              BIGINT,
+    tool_call_count          BIGINT,
+    tool_error_count         BIGINT,
+    avg_duration_ms          NUMERIC,
+    p95_duration_ms          NUMERIC,
+    total_tokens_input       BIGINT,
+    total_tokens_output      BIGINT,
+    total_tokens_cache_read  BIGINT,
+    total_tokens_cache_write BIGINT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        t.agent_id,
+        t.model,
+        COUNT(*)::bigint                                                     AS turn_count,
+        SUM(CASE WHEN t.result_type = 'error' THEN 1 ELSE 0 END)::bigint    AS error_count,
+        COALESCE(SUM(t.tool_calls),  0)::bigint                              AS tool_call_count,
+        COALESCE(SUM(t.tool_errors), 0)::bigint                              AS tool_error_count,
+        ROUND(AVG(t.duration_ms), 2)                                         AS avg_duration_ms,
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY t.duration_ms)::numeric AS p95_duration_ms,
+        COALESCE(SUM(t.tokens_input),       0)::bigint                       AS total_tokens_input,
+        COALESCE(SUM(t.tokens_output),      0)::bigint                       AS total_tokens_output,
+        COALESCE(SUM(t.tokens_cache_read),  0)::bigint                       AS total_tokens_cache_read,
+        COALESCE(SUM(t.tokens_cache_write), 0)::bigint                       AS total_tokens_cache_write
+    FROM ${s}.session_turn_metrics t
+    WHERE (p_since    IS NULL OR t.started_at >= p_since)
+      AND (p_agent_id IS NULL OR t.agent_id   =  p_agent_id)
+      AND (p_model    IS NULL OR t.model      =  p_model)
+    GROUP BY t.agent_id, t.model;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 6. cms_get_hourly_token_buckets ─────────────────────────────
+
+CREATE OR REPLACE FUNCTION ${s}.cms_get_hourly_token_buckets(
+    p_since    TIMESTAMPTZ,
+    p_agent_id TEXT DEFAULT NULL,
+    p_model    TEXT DEFAULT NULL
+) RETURNS TABLE (
+    hour_bucket              TIMESTAMPTZ,
+    turn_count               BIGINT,
+    total_tokens_input       BIGINT,
+    total_tokens_output      BIGINT,
+    total_tokens_cache_read  BIGINT,
+    total_tokens_cache_write BIGINT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        date_trunc('hour', t.started_at)                   AS hour_bucket,
+        COUNT(*)::bigint                                   AS turn_count,
+        COALESCE(SUM(t.tokens_input),       0)::bigint    AS total_tokens_input,
+        COALESCE(SUM(t.tokens_output),      0)::bigint    AS total_tokens_output,
+        COALESCE(SUM(t.tokens_cache_read),  0)::bigint    AS total_tokens_cache_read,
+        COALESCE(SUM(t.tokens_cache_write), 0)::bigint    AS total_tokens_cache_write
+    FROM ${s}.session_turn_metrics t
+    WHERE t.started_at >= p_since
+      AND (p_agent_id IS NULL OR t.agent_id = p_agent_id)
+      AND (p_model    IS NULL OR t.model    = p_model)
+    GROUP BY date_trunc('hour', t.started_at)
+    ORDER BY hour_bucket DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 7. cms_prune_turn_metrics ────────────────────────────────────
+
+CREATE OR REPLACE FUNCTION ${s}.cms_prune_turn_metrics(
+    p_older_than TIMESTAMPTZ
+) RETURNS INT AS $$
+DECLARE
+    v_deleted INT;
+BEGIN
+    DELETE FROM ${s}.session_turn_metrics
+    WHERE started_at < p_older_than;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 8. cms_upsert_db_call_metric_bucket_batch ────────────────────
+-- Expects a JSON array of {bucket, process, processRole, method,
+-- calls, errors, totalMs}. Returns the number of rows processed.
+-- Invalid rows are skipped; valid rows are still applied.
+
+CREATE OR REPLACE FUNCTION ${s}.cms_upsert_db_call_metric_bucket_batch(
+    p_rows JSONB
+) RETURNS INT AS $$
+DECLARE
+    v_row         JSONB;
+    v_bucket      TIMESTAMPTZ;
+    v_process     TEXT;
+    v_process_role TEXT;
+    v_method      TEXT;
+    v_calls       BIGINT;
+    v_errors      BIGINT;
+    v_total_ms    BIGINT;
+    v_count       INT := 0;
+BEGIN
+    IF p_rows IS NULL OR jsonb_typeof(p_rows) <> 'array' THEN
+        RETURN 0;
+    END IF;
+
+    FOR v_row IN SELECT value FROM jsonb_array_elements(p_rows)
+    LOOP
+        IF jsonb_typeof(v_row) <> 'object' THEN
+            CONTINUE;
+        END IF;
+
+        IF NULLIF(v_row->>'bucket', '') IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        v_process := NULLIF(v_row->>'process', '');
+        v_method := NULLIF(v_row->>'method', '');
+        IF v_process IS NULL OR v_method IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        v_process_role := COALESCE(NULLIF(v_row->>'processRole', ''), 'unknown');
+
+        BEGIN
+            v_bucket := (v_row->>'bucket')::timestamptz;
+        EXCEPTION WHEN invalid_text_representation OR datetime_field_overflow THEN
+            CONTINUE;
+        END;
+
+        v_calls := CASE
+            WHEN COALESCE(v_row->>'calls', '') ~ '^[+-]?[0-9]+$' THEN (v_row->>'calls')::bigint
+            ELSE 0
+        END;
+        v_errors := CASE
+            WHEN COALESCE(v_row->>'errors', '') ~ '^[+-]?[0-9]+$' THEN (v_row->>'errors')::bigint
+            ELSE 0
+        END;
+        v_total_ms := CASE
+            WHEN COALESCE(v_row->>'totalMs', '') ~ '^[+-]?[0-9]+$' THEN (v_row->>'totalMs')::bigint
+            ELSE 0
+        END;
+
+        INSERT INTO ${s}.db_call_metric_buckets (
+            bucket_minute, process_id, process_role, method,
+            calls, errors, total_ms
+        ) VALUES (
+            v_bucket, v_process, v_process_role, v_method,
+            v_calls, v_errors, v_total_ms
+        )
+        ON CONFLICT (bucket_minute, process_id, method) DO UPDATE SET
+            calls      = ${s}.db_call_metric_buckets.calls    + EXCLUDED.calls,
+            errors     = ${s}.db_call_metric_buckets.errors   + EXCLUDED.errors,
+            total_ms   = ${s}.db_call_metric_buckets.total_ms + EXCLUDED.total_ms,
+            updated_at = now();
+        v_count := v_count + 1;
+    END LOOP;
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 9. cms_get_fleet_db_call_metrics ────────────────────────────
+
+CREATE OR REPLACE FUNCTION ${s}.cms_get_fleet_db_call_metrics(
+    p_since TIMESTAMPTZ DEFAULT NULL
+) RETURNS TABLE (
+    method     TEXT,
+    calls      BIGINT,
+    errors     BIGINT,
+    total_ms   BIGINT,
+    avg_ms     NUMERIC,
+    error_rate NUMERIC
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        b.method,
+        SUM(b.calls)::bigint    AS calls,
+        SUM(b.errors)::bigint   AS errors,
+        SUM(b.total_ms)::bigint AS total_ms,
+        CASE WHEN SUM(b.calls) > 0
+             THEN ROUND(SUM(b.total_ms)::numeric / SUM(b.calls)::numeric, 2)
+             ELSE 0
+        END                     AS avg_ms,
+        CASE WHEN SUM(b.calls) > 0
+             THEN ROUND(SUM(b.errors)::numeric / SUM(b.calls)::numeric, 4)
+             ELSE 0
+        END                     AS error_rate
+    FROM ${s}.db_call_metric_buckets b
+    WHERE (p_since IS NULL OR b.bucket_minute >= p_since)
+    GROUP BY b.method
+    ORDER BY SUM(b.calls) DESC;
 END;
 $$ LANGUAGE plpgsql;
 `;

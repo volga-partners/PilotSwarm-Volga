@@ -4,6 +4,23 @@ function normalizeParams(params) {
     return params && typeof params === "object" ? params : {};
 }
 
+function parseOptionalDate(value) {
+    if (!value) return undefined;
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+}
+
+function parseRequiredDate(value, fieldName) {
+    if (!value) {
+        throw new Error(`Invalid RPC parameter "${fieldName}": required ISO date value`);
+    }
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) {
+        throw new Error(`Invalid RPC parameter "${fieldName}": expected ISO date value`);
+    }
+    return parsed;
+}
+
 export class PortalRuntime {
     constructor({ store, mode }) {
         this.transport = new NodeSdkTransport({ store, mode });
@@ -79,20 +96,20 @@ export class PortalRuntime {
             case "getFleetStats":
                 return this.transport.getFleetStats({
                     includeDeleted: safeParams.includeDeleted,
-                    since: safeParams.since ? new Date(safeParams.since) : undefined,
+                    since: parseOptionalDate(safeParams.since),
                 });
             case "getSessionSkillUsage":
                 return this.transport.getSessionSkillUsage(safeParams.sessionId, {
-                    since: safeParams.since ? new Date(safeParams.since) : undefined,
+                    since: parseOptionalDate(safeParams.since),
                 });
             case "getSessionTreeSkillUsage":
                 return this.transport.getSessionTreeSkillUsage(safeParams.sessionId, {
-                    since: safeParams.since ? new Date(safeParams.since) : undefined,
+                    since: parseOptionalDate(safeParams.since),
                 });
             case "getFleetSkillUsage":
                 return this.transport.getFleetSkillUsage({
                     includeDeleted: safeParams.includeDeleted,
-                    since: safeParams.since ? new Date(safeParams.since) : undefined,
+                    since: parseOptionalDate(safeParams.since),
                 });
             case "getSessionFactsStats":
                 return this.transport.getSessionFactsStats(safeParams.sessionId);
@@ -101,14 +118,39 @@ export class PortalRuntime {
             case "getSharedFactsStats":
                 return this.transport.getSharedFactsStats();
             case "pruneDeletedSummaries":
-                return this.transport.pruneDeletedSummaries(new Date(safeParams.olderThan));
+                return this.transport.pruneDeletedSummaries(parseRequiredDate(safeParams.olderThan, "olderThan"));
             case "getFleetObservabilityStats":
                 return this.transport.getFleetObservabilityStats({
                     includeDeleted: safeParams.includeDeleted,
-                    since: safeParams.since ? new Date(safeParams.since) : undefined,
+                    since: parseOptionalDate(safeParams.since),
                 });
             case "getDbCallMetrics":
                 return this.transport.getDbCallMetrics();
+            case "getSessionTurnMetrics":
+                return this.transport.getSessionTurnMetrics(safeParams.sessionId, {
+                    since: parseOptionalDate(safeParams.since),
+                    limit: safeParams.limit,
+                });
+            case "getFleetTurnAnalytics":
+                return this.transport.getFleetTurnAnalytics({
+                    since: parseOptionalDate(safeParams.since),
+                    agentId: safeParams.agentId,
+                    model: safeParams.model,
+                });
+            case "getHourlyTokenBuckets":
+                return this.transport.getHourlyTokenBuckets(
+                    parseRequiredDate(safeParams.since, "since"),
+                    {
+                        agentId: safeParams.agentId,
+                        model: safeParams.model,
+                    },
+                );
+            case "getFleetDbCallMetrics":
+                return this.transport.getFleetDbCallMetrics({
+                    since: parseOptionalDate(safeParams.since),
+                });
+            case "pruneTurnMetrics":
+                return this.transport.pruneTurnMetrics(parseRequiredDate(safeParams.olderThan, "olderThan"));
             case "getExecutionHistory":
                 return this.transport.getExecutionHistory(safeParams.sessionId, safeParams.executionId);
             case "createSession":
