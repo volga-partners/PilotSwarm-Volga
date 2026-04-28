@@ -144,7 +144,7 @@ export async function startServer(opts = {}) {
             const result = await runtime.call(method, req.body?.params || {});
             res.json({ ok: true, result });
         } catch (error) {
-            const status = /Unsupported portal RPC method/i.test(String(error?.message || ""))
+            const status = /Unsupported portal RPC method|Invalid RPC parameter/i.test(String(error?.message || ""))
                 ? 400
                 : 500;
             const payload = createJsonRpcError(error, status);

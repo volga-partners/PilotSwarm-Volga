@@ -512,7 +512,7 @@ export function registerActivities(
         const trace = activityTrace(activityCtx, "runTurn");
 
         const failForMissingState = async (message: string) => {
-            flushTurnSummaryMetrics("error");
+            flushTurnSummaryMetrics("error", message);
             await flushBufferedEvents();
             if (catalog) {
                 await catalog.updateSession(input.sessionId, {
@@ -554,8 +554,9 @@ export function registerActivities(
         let accTokensCacheRead  = 0;
         let accTokensCacheWrite = 0;
         let turnSummaryFlushed  = false;
+        let turnMetricInserted  = false;
 
-        const flushTurnSummaryMetrics = (finalResultType: string | null) => {
+        const flushTurnSummaryMetrics = (finalResultType: string | null, errorMessage: string | null = null) => {
             if (turnSummaryFlushed || !catalog) return;
             turnSummaryFlushed = true;
             const durationMs = Date.now() - turnStartedAt;
@@ -572,10 +573,37 @@ export function registerActivities(
             }).catch((err: any) => {
                 activityCtx.traceInfo(`[runTurn] CMS turn summary flush failed: ${err}`);
             });
+            const insertTurnMetric = (catalog as any).insertTurnMetric;
+            if (!turnMetricInserted && typeof insertTurnMetric === "function") {
+                turnMetricInserted = true;
+                Promise.resolve(insertTurnMetric.call(catalog, {
+                    sessionId:       input.sessionId,
+                    agentId:         runConfig.agentIdentity ?? null,
+                    model:           runConfig.model ?? null,
+                    turnIndex:       input.turnIndex ?? 0,
+                    startedAt:       new Date(turnStartedAt),
+                    endedAt:         new Date(),
+                    durationMs,
+                    tokensInput:     accTokensInput,
+                    tokensOutput:    accTokensOutput,
+                    tokensCacheRead: accTokensCacheRead,
+                    tokensCacheWrite: accTokensCacheWrite,
+                    toolCalls:       toolCallCounter,
+                    toolErrors:      toolErrorCounter,
+                    resultType:      finalResultType,
+                    errorMessage,
+                    workerNodeId:    workerNodeId ?? null,
+                })).catch((err: any) => {
+                    activityCtx.traceInfo(`[runTurn] CMS insertTurnMetric failed: ${err}`);
+                });
+            }
         };
 
         const finalizeTurn = async (result: TurnResult): Promise<TurnResult> => {
-            flushTurnSummaryMetrics(result.type ?? null);
+            flushTurnSummaryMetrics(
+                result.type ?? null,
+                result.type === "error" ? (result as any).message ?? null : null,
+            );
             await flushBufferedEvents();
             return result;
         };

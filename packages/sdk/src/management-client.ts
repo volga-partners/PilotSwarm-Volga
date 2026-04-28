@@ -31,7 +31,12 @@ import type {
     SkillUsageRow,
     SessionTreeSkillUsage,
     FleetSkillUsage,
+    TurnMetricRow,
+    FleetTurnAnalyticsRow,
+    HourlyTokenBucketRow,
+    FleetDbCallMetricRow,
 } from "./cms.js";
+import { DbMetricsReporter, makeProcessId, makeProcessRole } from "./db-metrics-reporter.js";
 import type { FactStore, FactsStatsRow } from "./facts-store.js";
 import { createFactStoreForUrl } from "./facts-store.js";
 import { SessionDumper } from "./session-dumper.js";
@@ -260,6 +265,7 @@ export class PilotSwarmManagementClient {
     private _modelProviders: ModelProviderRegistry | null = null;
     private _activeStatusWaitControllers = new Set<AbortController>();
     private _activeStatusWaitPromises = new Set<Promise<unknown>>();
+    private _reporter: DbMetricsReporter | null = null;
     private _started = false;
 
     constructor(options: PilotSwarmManagementClientOptions) {
@@ -272,42 +278,77 @@ export class PilotSwarmManagementClient {
         if (this._started) return;
         const store = this.config.store;
         const _trace = this.config.traceWriter ?? (() => {});
+        try {
+            // Create duroxide client
+            let provider: any;
+            if (store === "sqlite::memory:") provider = SqliteProvider.inMemory();
+            else if (store.startsWith("sqlite://")) provider = SqliteProvider.open(store);
+            else if (store.startsWith("postgres://") || store.startsWith("postgresql://")) {
+                _trace("[mgmt] connectWithSchema start...");
+                provider = await PostgresProvider.connectWithSchema(
+                    store,
+                    this.config.duroxideSchema ?? DEFAULT_DUROXIDE_SCHEMA,
+                );
+                _trace("[mgmt] connectWithSchema done");
+            } else {
+                throw new Error(`Unsupported store URL: ${store}`);
+            }
+            this._duroxideClient = new Client(provider);
 
-        // Create duroxide client
-        let provider: any;
-        if (store === "sqlite::memory:") provider = SqliteProvider.inMemory();
-        else if (store.startsWith("sqlite://")) provider = SqliteProvider.open(store);
-        else if (store.startsWith("postgres://") || store.startsWith("postgresql://")) {
-            _trace("[mgmt] connectWithSchema start...");
-            provider = await PostgresProvider.connectWithSchema(
-                store,
-                this.config.duroxideSchema ?? DEFAULT_DUROXIDE_SCHEMA,
-            );
-            _trace("[mgmt] connectWithSchema done");
-        } else {
-            throw new Error(`Unsupported store URL: ${store}`);
+            // Create CMS catalog
+            if (store.startsWith("postgres://") || store.startsWith("postgresql://")) {
+                _trace("[mgmt] CMS create start...");
+                this._catalog = await PgSessionCatalogProvider.create(store, this.config.cmsSchema);
+                _trace("[mgmt] CMS initialize start...");
+                await this._catalog.initialize();
+                _trace("[mgmt] CMS initialize done");
+
+                this._reporter = new DbMetricsReporter({
+                    catalog:     this._catalog,
+                    metrics:     globalDbMetrics,
+                    processId:   makeProcessId(),
+                    processRole: makeProcessRole(),
+                });
+            }
+
+            _trace("[mgmt] facts create start...");
+            this._factStore = await createFactStoreForUrl(store, this.config.factsSchema);
+            _trace("[mgmt] facts initialize start...");
+            await this._factStore.initialize();
+            _trace("[mgmt] facts initialize done");
+
+            // Load model providers
+            this._modelProviders = loadModelProviders(this.config.modelProvidersPath);
+
+            this._started = true;
+
+            // Start reporter last so partial startup failures never leave a live timer running.
+            if (this._reporter) {
+                try {
+                    this._reporter.start();
+                } catch (err: any) {
+                    _trace(`[mgmt] reporter start failed (non-fatal): ${err?.message ?? String(err)}`);
+                }
+            }
+        } catch (err) {
+            // Best-effort rollback of partially initialized resources.
+            if (this._reporter) {
+                try { this._reporter.stop(); } catch {}
+                this._reporter = null;
+            }
+            if (this._factStore) {
+                try { await this._factStore.close(); } catch {}
+                this._factStore = null;
+            }
+            if (this._catalog) {
+                try { await this._catalog.close(); } catch {}
+                this._catalog = null;
+            }
+            this._duroxideClient = null;
+            this._modelProviders = null;
+            this._started = false;
+            throw err;
         }
-        this._duroxideClient = new Client(provider);
-
-        // Create CMS catalog
-        if (store.startsWith("postgres://") || store.startsWith("postgresql://")) {
-            _trace("[mgmt] CMS create start...");
-            this._catalog = await PgSessionCatalogProvider.create(store, this.config.cmsSchema);
-            _trace("[mgmt] CMS initialize start...");
-            await this._catalog.initialize();
-            _trace("[mgmt] CMS initialize done");
-        }
-
-        _trace("[mgmt] facts create start...");
-        this._factStore = await createFactStoreForUrl(store, this.config.factsSchema);
-        _trace("[mgmt] facts initialize start...");
-        await this._factStore.initialize();
-        _trace("[mgmt] facts initialize done");
-
-        // Load model providers
-        this._modelProviders = loadModelProviders(this.config.modelProvidersPath);
-
-        this._started = true;
     }
 
     async stop(): Promise<void> {
@@ -316,6 +357,10 @@ export class PilotSwarmManagementClient {
         }
         await Promise.allSettled([...this._activeStatusWaitPromises]);
 
+        if (this._reporter) {
+            try { this._reporter.stop(); } catch {}
+            this._reporter = null;
+        }
         if (this._factStore) {
             try { await this._factStore.close(); } catch {}
             this._factStore = null;
@@ -909,6 +954,61 @@ export class PilotSwarmManagementClient {
     async pruneDeletedSummaries(olderThan: Date): Promise<number> {
         this._ensureStarted();
         return this._catalog!.pruneDeletedSummaries(olderThan);
+    }
+
+    // ─── Phase 2 Analytics ───────────────────────────────────
+
+    /**
+     * Turn-level metrics for a single session, ordered by turn_index DESC.
+     * Returns [] when running without a PostgreSQL CMS (e.g. SQLite mode).
+     */
+    async getSessionTurnMetrics(sessionId: string, opts?: { since?: Date; limit?: number }): Promise<TurnMetricRow[]> {
+        this._ensureStarted();
+        if (!this._catalog) return [];
+        return this._catalog.getSessionTurnMetrics(sessionId, opts);
+    }
+
+    /**
+     * Fleet-wide turn analytics aggregated by (agent_id, model).
+     * Optionally filter by since, agentId, and model.
+     * Returns [] when running without a PostgreSQL CMS.
+     */
+    async getFleetTurnAnalytics(opts?: { since?: Date; agentId?: string; model?: string }): Promise<FleetTurnAnalyticsRow[]> {
+        this._ensureStarted();
+        if (!this._catalog) return [];
+        return this._catalog.getFleetTurnAnalytics(opts);
+    }
+
+    /**
+     * Hourly token usage buckets fleet-wide, optionally filtered by agent and model.
+     * Useful for time-series charts in analytics UIs.
+     * Returns [] when running without a PostgreSQL CMS.
+     */
+    async getHourlyTokenBuckets(since: Date, opts?: { agentId?: string; model?: string }): Promise<HourlyTokenBucketRow[]> {
+        this._ensureStarted();
+        if (!this._catalog) return [];
+        return this._catalog.getHourlyTokenBuckets(since, opts);
+    }
+
+    /**
+     * Fleet-wide DB call metrics aggregated by method from db_call_metric_buckets.
+     * Returns per-process totals accumulated across all reporting workers since `since`.
+     * Returns [] when running without a PostgreSQL CMS.
+     */
+    async getFleetDbCallMetrics(opts?: { since?: Date }): Promise<FleetDbCallMetricRow[]> {
+        this._ensureStarted();
+        if (!this._catalog) return [];
+        return this._catalog.getFleetDbCallMetrics(opts);
+    }
+
+    /**
+     * Prune turn metric rows older than `olderThan`.
+     * Returns the number of rows deleted, or 0 when running without a PostgreSQL CMS.
+     */
+    async pruneTurnMetrics(olderThan: Date): Promise<number> {
+        this._ensureStarted();
+        if (!this._catalog) return 0;
+        return this._catalog.pruneTurnMetrics(olderThan);
     }
 
     /**

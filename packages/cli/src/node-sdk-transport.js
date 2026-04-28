@@ -555,6 +555,26 @@ export class NodeSdkTransport {
         return this.mgmt.getDbCallMetrics();
     }
 
+    async getSessionTurnMetrics(sessionId, opts) {
+        return this.mgmt.getSessionTurnMetrics(sessionId, opts);
+    }
+
+    async getFleetTurnAnalytics(opts) {
+        return this.mgmt.getFleetTurnAnalytics(opts);
+    }
+
+    async getHourlyTokenBuckets(since, opts) {
+        return this.mgmt.getHourlyTokenBuckets(since, opts);
+    }
+
+    async getFleetDbCallMetrics(opts) {
+        return this.mgmt.getFleetDbCallMetrics(opts);
+    }
+
+    async pruneTurnMetrics(olderThan) {
+        return this.mgmt.pruneTurnMetrics(olderThan);
+    }
+
     async getExecutionHistory(sessionId, executionId) {
         return this.mgmt.getExecutionHistory(sessionId, executionId);
     }

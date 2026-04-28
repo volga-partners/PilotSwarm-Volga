@@ -243,6 +243,97 @@ export interface FleetSkillUsage {
     rows: FleetSkillUsageRow[];
 }
 
+// ─── Turn Metrics + DB Bucket Types (Phase 2) ────────────────────
+
+/** Input for inserting a single turn metric row. */
+export interface InsertTurnMetricInput {
+    sessionId:        string;
+    agentId:          string | null;
+    model:            string | null;
+    turnIndex:        number;
+    startedAt:        Date;
+    endedAt:          Date;
+    durationMs:       number;
+    tokensInput:      number;
+    tokensOutput:     number;
+    tokensCacheRead:  number;
+    tokensCacheWrite: number;
+    toolCalls:        number;
+    toolErrors:       number;
+    resultType:       string | null;
+    errorMessage:     string | null;
+    workerNodeId:     string | null;
+}
+
+/** One row from session_turn_metrics. */
+export interface TurnMetricRow {
+    id:               number;
+    sessionId:        string;
+    agentId:          string | null;
+    model:            string | null;
+    turnIndex:        number;
+    startedAt:        Date;
+    endedAt:          Date;
+    durationMs:       number;
+    tokensInput:      number;
+    tokensOutput:     number;
+    tokensCacheRead:  number;
+    tokensCacheWrite: number;
+    toolCalls:        number;
+    toolErrors:       number;
+    resultType:       string | null;
+    errorMessage:     string | null;
+    workerNodeId:     string | null;
+    createdAt:        Date;
+}
+
+/** One row from cms_get_fleet_turn_analytics. */
+export interface FleetTurnAnalyticsRow {
+    agentId:               string | null;
+    model:                 string | null;
+    turnCount:             number;
+    errorCount:            number;
+    toolCallCount:         number;
+    toolErrorCount:        number;
+    avgDurationMs:         number;
+    p95DurationMs:         number;
+    totalTokensInput:      number;
+    totalTokensOutput:     number;
+    totalTokensCacheRead:  number;
+    totalTokensCacheWrite: number;
+}
+
+/** One row from cms_get_hourly_token_buckets. */
+export interface HourlyTokenBucketRow {
+    hourBucket:            Date;
+    turnCount:             number;
+    totalTokensInput:      number;
+    totalTokensOutput:     number;
+    totalTokensCacheRead:  number;
+    totalTokensCacheWrite: number;
+}
+
+/** Input row for upsert batch — one entry per (bucket_minute, process_id, method). */
+export interface DbCallMetricBucketInput {
+    bucket:      Date;
+    process:     string;
+    processRole: string;
+    method:      string;
+    calls:       number;
+    errors:      number;
+    totalMs:     number;
+}
+
+/** One row from cms_get_fleet_db_call_metrics. */
+export interface FleetDbCallMetricRow {
+    method:    string;
+    calls:     number;
+    errors:    number;
+    totalMs:   number;
+    avgMs:     number;
+    errorRate: number;
+}
+
 // ─── Provider Interface ──────────────────────────────────────────
 
 /**
@@ -317,6 +408,29 @@ export interface SessionCatalogProvider {
     /** Hard-delete summary rows for sessions deleted before the cutoff. Returns count removed. */
     pruneDeletedSummaries(olderThan: Date): Promise<number>;
 
+    // ── Turn Metrics (Phase 2) ────────────────────────────────
+
+    /** Insert a single turn metric row. Fire-and-forget safe. */
+    insertTurnMetric(input: InsertTurnMetricInput): Promise<void>;
+
+    /** Get turn metrics for a session, most-recent-first. */
+    getSessionTurnMetrics(sessionId: string, opts?: { since?: Date; limit?: number }): Promise<TurnMetricRow[]>;
+
+    /** Fleet-wide turn analytics with p95, grouped by (agentId, model). */
+    getFleetTurnAnalytics(opts?: { since?: Date; agentId?: string; model?: string }): Promise<FleetTurnAnalyticsRow[]>;
+
+    /** Hourly token bucket rollup from session_turn_metrics. */
+    getHourlyTokenBuckets(since: Date, opts?: { agentId?: string; model?: string }): Promise<HourlyTokenBucketRow[]>;
+
+    /** Hard-delete turn metrics older than the cutoff. Returns count removed. */
+    pruneTurnMetrics(olderThan: Date): Promise<number>;
+
+    /** Upsert a batch of per-minute DB call metric buckets. Returns rows processed. */
+    upsertDbCallMetricBucketBatch(rows: DbCallMetricBucketInput[]): Promise<number>;
+
+    /** Fleet-wide DB call metrics aggregated from db_call_metric_buckets. */
+    getFleetDbCallMetrics(opts?: { since?: Date }): Promise<FleetDbCallMetricRow[]>;
+
     /** Cleanup / close connections. */
     close(): Promise<void>;
 }
@@ -388,9 +502,16 @@ function sqlForSchema(schema: string) {
             getFleetStatsTotals:        `${s}.cms_get_fleet_stats_totals`,
             upsertSessionMetricSummary: `${s}.cms_upsert_session_metric_summary`,
             pruneDeletedSummaries:      `${s}.cms_prune_deleted_summaries`,
-            getSessionSkillUsage:       `${s}.cms_get_session_skill_usage`,
-            getSessionTreeSkillUsage:   `${s}.cms_get_session_tree_skill_usage`,
-            getFleetSkillUsage:         `${s}.cms_get_fleet_skill_usage`,
+            getSessionSkillUsage:             `${s}.cms_get_session_skill_usage`,
+            getSessionTreeSkillUsage:         `${s}.cms_get_session_tree_skill_usage`,
+            getFleetSkillUsage:               `${s}.cms_get_fleet_skill_usage`,
+            insertTurnMetric:                 `${s}.cms_insert_turn_metric`,
+            getSessionTurnMetrics:            `${s}.cms_get_session_turn_metrics`,
+            getFleetTurnAnalytics:            `${s}.cms_get_fleet_turn_analytics`,
+            getHourlyTokenBuckets:            `${s}.cms_get_hourly_token_buckets`,
+            pruneTurnMetrics:                 `${s}.cms_prune_turn_metrics`,
+            upsertDbCallMetricBucketBatch:    `${s}.cms_upsert_db_call_metric_bucket_batch`,
+            getFleetDbCallMetrics:            `${s}.cms_get_fleet_db_call_metrics`,
         },
     };
 }
@@ -822,6 +943,104 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
         });
     }
 
+    // ── Turn Metrics (Phase 2) ───────────────────────────────
+
+    async insertTurnMetric(input: InsertTurnMetricInput): Promise<void> {
+        return measureDbCall("cms.insertTurnMetric", async () => {
+            await this.pool.query(
+                `SELECT ${this.sql.fn.insertTurnMetric}($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
+                [
+                    input.sessionId,
+                    input.agentId,
+                    input.model,
+                    input.turnIndex,
+                    input.startedAt,
+                    input.endedAt,
+                    input.durationMs,
+                    input.tokensInput,
+                    input.tokensOutput,
+                    input.tokensCacheRead,
+                    input.tokensCacheWrite,
+                    input.toolCalls,
+                    input.toolErrors,
+                    input.resultType,
+                    input.errorMessage,
+                    input.workerNodeId,
+                ],
+            );
+        });
+    }
+
+    async getSessionTurnMetrics(sessionId: string, opts?: { since?: Date; limit?: number }): Promise<TurnMetricRow[]> {
+        return measureDbCall("cms.getSessionTurnMetrics", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getSessionTurnMetrics}($1, $2, $3)`,
+                [sessionId, opts?.since ?? null, opts?.limit ?? 200],
+            );
+            return rows.map(rowToTurnMetricRow);
+        });
+    }
+
+    async getFleetTurnAnalytics(opts?: { since?: Date; agentId?: string; model?: string }): Promise<FleetTurnAnalyticsRow[]> {
+        return measureDbCall("cms.getFleetTurnAnalytics", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getFleetTurnAnalytics}($1, $2, $3)`,
+                [opts?.since ?? null, opts?.agentId ?? null, opts?.model ?? null],
+            );
+            return rows.map(rowToFleetTurnAnalyticsRow);
+        });
+    }
+
+    async getHourlyTokenBuckets(since: Date, opts?: { agentId?: string; model?: string }): Promise<HourlyTokenBucketRow[]> {
+        return measureDbCall("cms.getHourlyTokenBuckets", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getHourlyTokenBuckets}($1, $2, $3)`,
+                [since, opts?.agentId ?? null, opts?.model ?? null],
+            );
+            return rows.map(rowToHourlyTokenBucketRow);
+        });
+    }
+
+    async pruneTurnMetrics(olderThan: Date): Promise<number> {
+        return measureDbCall("cms.pruneTurnMetrics", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT ${this.sql.fn.pruneTurnMetrics}($1) AS pruned_count`,
+                [olderThan],
+            );
+            return Number(rows[0]?.pruned_count) || 0;
+        });
+    }
+
+    async upsertDbCallMetricBucketBatch(rows: DbCallMetricBucketInput[]): Promise<number> {
+        if (rows.length === 0) return 0;
+        return measureDbCall("cms.upsertDbCallMetricBucketBatch", async () => {
+            const payload = rows.map(r => ({
+                bucket:      r.bucket instanceof Date ? r.bucket.toISOString() : r.bucket,
+                process:     r.process,
+                processRole: r.processRole,
+                method:      r.method,
+                calls:       r.calls,
+                errors:      r.errors,
+                totalMs:     r.totalMs,
+            }));
+            const { rows: result } = await this.pool.query(
+                `SELECT ${this.sql.fn.upsertDbCallMetricBucketBatch}($1) AS row_count`,
+                [JSON.stringify(payload)],
+            );
+            return Number(result[0]?.row_count) || 0;
+        });
+    }
+
+    async getFleetDbCallMetrics(opts?: { since?: Date }): Promise<FleetDbCallMetricRow[]> {
+        return measureDbCall("cms.getFleetDbCallMetrics", async () => {
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getFleetDbCallMetrics}($1)`,
+                [opts?.since ?? null],
+            );
+            return rows.map(rowToFleetDbCallMetricRow);
+        });
+    }
+
     async close(): Promise<void> {
         if (this.pool) {
             await this.pool.end();
@@ -910,5 +1129,71 @@ function rowToSkillUsageRow(row: any): SkillUsageRow {
         invocations: Number(row.invocations) || 0,
         firstUsedAt: new Date(row.first_used_at ?? row.last_used_at),
         lastUsedAt: new Date(row.last_used_at),
+    };
+}
+
+/** Map a PG row to TurnMetricRow. */
+function rowToTurnMetricRow(row: any): TurnMetricRow {
+    return {
+        id:               Number(row.id),
+        sessionId:        row.session_id,
+        agentId:          row.agent_id ?? null,
+        model:            row.model ?? null,
+        turnIndex:        Number(row.turn_index),
+        startedAt:        new Date(row.started_at),
+        endedAt:          new Date(row.ended_at),
+        durationMs:       Number(row.duration_ms) || 0,
+        tokensInput:      Number(row.tokens_input) || 0,
+        tokensOutput:     Number(row.tokens_output) || 0,
+        tokensCacheRead:  Number(row.tokens_cache_read) || 0,
+        tokensCacheWrite: Number(row.tokens_cache_write) || 0,
+        toolCalls:        Number(row.tool_calls) || 0,
+        toolErrors:       Number(row.tool_errors) || 0,
+        resultType:       row.result_type ?? null,
+        errorMessage:     row.error_message ?? null,
+        workerNodeId:     row.worker_node_id ?? null,
+        createdAt:        new Date(row.created_at),
+    };
+}
+
+/** Map a PG row to FleetTurnAnalyticsRow. */
+function rowToFleetTurnAnalyticsRow(row: any): FleetTurnAnalyticsRow {
+    return {
+        agentId:               row.agent_id ?? null,
+        model:                 row.model ?? null,
+        turnCount:             Number(row.turn_count) || 0,
+        errorCount:            Number(row.error_count) || 0,
+        toolCallCount:         Number(row.tool_call_count) || 0,
+        toolErrorCount:        Number(row.tool_error_count) || 0,
+        avgDurationMs:         Number(row.avg_duration_ms) || 0,
+        p95DurationMs:         Number(row.p95_duration_ms) || 0,
+        totalTokensInput:      Number(row.total_tokens_input) || 0,
+        totalTokensOutput:     Number(row.total_tokens_output) || 0,
+        totalTokensCacheRead:  Number(row.total_tokens_cache_read) || 0,
+        totalTokensCacheWrite: Number(row.total_tokens_cache_write) || 0,
+    };
+}
+
+/** Map a PG row to HourlyTokenBucketRow. */
+function rowToHourlyTokenBucketRow(row: any): HourlyTokenBucketRow {
+    return {
+        hourBucket:            new Date(row.hour_bucket),
+        turnCount:             Number(row.turn_count) || 0,
+        totalTokensInput:      Number(row.total_tokens_input) || 0,
+        totalTokensOutput:     Number(row.total_tokens_output) || 0,
+        totalTokensCacheRead:  Number(row.total_tokens_cache_read) || 0,
+        totalTokensCacheWrite: Number(row.total_tokens_cache_write) || 0,
+    };
+}
+
+/** Map a PG row to FleetDbCallMetricRow. */
+function rowToFleetDbCallMetricRow(row: any): FleetDbCallMetricRow {
+    return {
+        method:    String(row.method),
+        calls:     Number(row.calls) || 0,
+        errors:    Number(row.errors) || 0,
+        totalMs:   Number(row.total_ms) || 0,
+        avgMs:     Number(row.avg_ms) || 0,
+        errorRate: Number(row.error_rate) || 0,
     };
 }

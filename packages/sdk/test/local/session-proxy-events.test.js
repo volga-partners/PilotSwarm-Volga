@@ -18,6 +18,7 @@ function makeHarness(options = {}) {
     const sessionManager = {
         getOrCreate: vi.fn(async () => session),
         getModelSummary: vi.fn(() => undefined),
+        getPromptGuardrails: vi.fn(() => ({ enabled: false })),
         invalidateWarmSession: vi.fn(async () => {}),
         resetSessionState: vi.fn(async () => {}),
         dehydrate: vi.fn(async () => {}),
@@ -31,6 +32,7 @@ function makeHarness(options = {}) {
             recordedEvents.push(...events);
         }),
         upsertSessionMetricSummary: vi.fn(async () => {}),
+        insertTurnMetric: vi.fn(async () => {}),
         updateSession: vi.fn(async () => {}),
     };
 
@@ -336,6 +338,12 @@ describe("session-proxy CMS prompt classification", () => {
                 lastError: expect.stringContaining("unrecoverable live Copilot session loss"),
             }),
         );
+        expect(catalog.insertTurnMetric).toHaveBeenCalledTimes(1);
+        expect(catalog.insertTurnMetric).toHaveBeenCalledWith(expect.objectContaining({
+            sessionId: "session-fatal",
+            resultType: "error",
+            errorMessage: expect.stringContaining("unrecoverable live Copilot session loss"),
+        }));
     });
 
     it("records structured dehydration details for observability", async () => {
@@ -519,5 +527,106 @@ describe("session-proxy CMS prompt classification", () => {
         const traces = traceInfo.mock.calls.map(([message]) => String(message)).join("\n");
         expect(traces).toContain("[needsHydrationSession] session=session-needs-hydration-1 start");
         expect(traces).toContain("[needsHydrationSession] session=session-needs-hydration-1 result=true");
+    });
+});
+
+describe("session-proxy turn metric insertion", () => {
+    it("inserts one turn metric row for a normal completed turn", async () => {
+        const { runTurn, catalog } = makeHarness();
+
+        const result = await runTurn(
+            { traceInfo: () => {}, isCancelled: () => false },
+            {
+                sessionId: "metric-completed",
+                prompt: "hello",
+                config: {},
+                turnIndex: 11,
+            },
+        );
+
+        expect(result.type).toBe("completed");
+        expect(catalog.upsertSessionMetricSummary).toHaveBeenCalledTimes(1);
+        expect(catalog.insertTurnMetric).toHaveBeenCalledTimes(1);
+        expect(catalog.insertTurnMetric).toHaveBeenCalledWith(expect.objectContaining({
+            sessionId: "metric-completed",
+            turnIndex: 11,
+            resultType: "completed",
+            errorMessage: null,
+        }));
+    });
+
+    it("inserts one turn metric row for a cancelled turn", async () => {
+        vi.useFakeTimers();
+        try {
+            const { runTurn, session, catalog } = makeHarness();
+            let resolveTurn;
+            session.runTurn = vi.fn(() => new Promise((resolve) => {
+                resolveTurn = resolve;
+            }));
+
+            const runPromise = runTurn(
+                { traceInfo: () => {}, isCancelled: () => true },
+                {
+                    sessionId: "metric-cancelled",
+                    prompt: "cancel me",
+                    config: {},
+                    turnIndex: 12,
+                },
+            );
+
+            await vi.advanceTimersByTimeAsync(2_100);
+            resolveTurn({ type: "completed", content: "late", events: [] });
+            const result = await runPromise;
+
+            expect(result.type).toBe("cancelled");
+            expect(session.abort).toHaveBeenCalledTimes(1);
+            expect(catalog.insertTurnMetric).toHaveBeenCalledTimes(1);
+            expect(catalog.insertTurnMetric).toHaveBeenCalledWith(expect.objectContaining({
+                sessionId: "metric-cancelled",
+                resultType: "cancelled",
+                errorMessage: null,
+            }));
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    it("inserts one turn metric row for an error turn with message", async () => {
+        const { runTurn, session, catalog } = makeHarness();
+        session.runTurn = vi.fn(async () => ({ type: "error", message: "boom", events: [] }));
+
+        const result = await runTurn(
+            { traceInfo: () => {}, isCancelled: () => false },
+            {
+                sessionId: "metric-error",
+                prompt: "explode",
+                config: {},
+                turnIndex: 13,
+            },
+        );
+
+        expect(result.type).toBe("error");
+        expect(catalog.insertTurnMetric).toHaveBeenCalledTimes(1);
+        expect(catalog.insertTurnMetric).toHaveBeenCalledWith(expect.objectContaining({
+            sessionId: "metric-error",
+            resultType: "error",
+            errorMessage: "boom",
+        }));
+    });
+
+    it("does not duplicate insertTurnMetric when finalize and finally both execute", async () => {
+        const { runTurn, catalog } = makeHarness();
+
+        await runTurn(
+            { traceInfo: () => {}, isCancelled: () => false },
+            {
+                sessionId: "metric-no-duplicate",
+                prompt: "no duplicate",
+                config: {},
+                turnIndex: 14,
+            },
+        );
+
+        expect(catalog.insertTurnMetric).toHaveBeenCalledTimes(1);
     });
 });

@@ -37,7 +37,7 @@ export { SessionBlobStore } from "./blob-store.js";
 export { FilesystemSessionStore, FilesystemArtifactStore } from "./session-store.js";
 export { PgFactStore, createFactStoreForUrl } from "./facts-store.js";
 export { PgSessionCatalogProvider, computeCacheHitRatio } from "./cms.js";
-export type { SessionCatalogProvider, SessionRow, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage } from "./cms.js";
+export type { SessionCatalogProvider, SessionRow, SessionRowUpdates, SessionEvent, SessionMetricSummary, SessionMetricSummaryUpsert, FleetStats, SessionTreeStats, SkillKind, SkillUsageRow, SessionTreeSkillUsage, FleetSkillUsageRow, FleetSkillUsage, InsertTurnMetricInput, TurnMetricRow, FleetTurnAnalyticsRow, HourlyTokenBucketRow, DbCallMetricBucketInput, FleetDbCallMetricRow } from "./cms.js";
 export { globalDbMetrics } from "./db-metrics.js";
 export type { DbMetricsSnapshot } from "./db-metrics.js";
 export { estimateCostUsd, MODEL_PRICING } from "./model-pricing.js";
