@@ -49,6 +49,11 @@ function assertNotIncludes(src, needle, label) {
 describe("node-sdk-transport — Phase 2 delegation methods", () => {
     const src = readRepoFile("packages/cli/src/node-sdk-transport.js");
 
+    it("delegates listSessionsPage to mgmt", () => {
+        assertIncludes(src, "async listSessionsPage(params)", "node transport missing listSessionsPage");
+        assertIncludes(src, "this.mgmt.listSessionsPage(params)", "node transport must delegate to mgmt.listSessionsPage");
+    });
+
     it("delegates getSessionTurnMetrics to mgmt", () => {
         assertIncludes(src, "async getSessionTurnMetrics(sessionId, opts)", "node transport missing getSessionTurnMetrics");
         assertIncludes(src, "this.mgmt.getSessionTurnMetrics(sessionId, opts)", "node transport must delegate to mgmt.getSessionTurnMetrics");
@@ -72,6 +77,21 @@ describe("node-sdk-transport — Phase 2 delegation methods", () => {
     it("delegates pruneTurnMetrics to mgmt", () => {
         assertIncludes(src, "async pruneTurnMetrics(olderThan)", "node transport missing pruneTurnMetrics");
         assertIncludes(src, "this.mgmt.pruneTurnMetrics(olderThan)", "node transport must delegate to mgmt.pruneTurnMetrics");
+    });
+
+    it("delegates getSessionEvents to mgmt", () => {
+        assertIncludes(src, "async getSessionEvents(", "node transport missing getSessionEvents");
+        assertIncludes(src, "this.mgmt.getSessionEvents(", "node transport must delegate to mgmt.getSessionEvents");
+    });
+
+    it("delegates getSessionEventsBefore to mgmt", () => {
+        assertIncludes(src, "async getSessionEventsBefore(", "node transport missing getSessionEventsBefore");
+        assertIncludes(src, "this.mgmt.getSessionEventsBefore(", "node transport must delegate to mgmt.getSessionEventsBefore");
+    });
+
+    it("delegates getTopEventEmitters to mgmt", () => {
+        assertIncludes(src, "async getTopEventEmitters(params)", "node transport missing getTopEventEmitters");
+        assertIncludes(src, "this.mgmt.getTopEventEmitters(params)", "node transport must delegate to mgmt.getTopEventEmitters");
     });
 });
 
@@ -104,7 +124,9 @@ describe("runtime.js — Phase 2 switch cases and date normalization", () => {
     it("normalizes since/agentId/model params for getFleetTurnAnalytics", () => {
         const start = src.indexOf('case "getFleetTurnAnalytics":');
         const caseBlock = src.slice(start, start + 400);
-        assertIncludes(caseBlock, "parseOptionalDate(safeParams.since)", "runtime must convert since for getFleetTurnAnalytics");
+        assertIncludes(caseBlock, 'parseOptionalDate(safeParams.since, "since")', "runtime must validate+convert since for getFleetTurnAnalytics");
+        assertIncludes(caseBlock, "defaultSinceDays(", "runtime must default missing since window for getFleetTurnAnalytics");
+        assertIncludes(caseBlock, "enforceMaxWindowDays(", "runtime must enforce max since window for getFleetTurnAnalytics");
         assertIncludes(caseBlock, "safeParams.agentId", "runtime must forward agentId");
         assertIncludes(caseBlock, "safeParams.model", "runtime must forward model");
     });
@@ -120,7 +142,17 @@ describe("runtime.js — Phase 2 switch cases and date normalization", () => {
         assertIncludes(src, 'case "getFleetDbCallMetrics":', "runtime missing getFleetDbCallMetrics switch case");
         const start = src.indexOf('case "getFleetDbCallMetrics":');
         const caseBlock = src.slice(start, start + 300);
-        assertIncludes(caseBlock, "parseOptionalDate(safeParams.since)", "runtime must convert since for getFleetDbCallMetrics");
+        assertIncludes(caseBlock, 'parseOptionalDate(safeParams.since, "since")', "runtime must validate+convert since for getFleetDbCallMetrics");
+        assertIncludes(caseBlock, "defaultSinceDays(", "runtime must default missing since window for getFleetDbCallMetrics");
+        assertIncludes(caseBlock, "enforceMaxWindowDays(", "runtime must enforce max since window for getFleetDbCallMetrics");
+    });
+
+    it("has switch case for listSessionsPage with limit cap", () => {
+        assertIncludes(src, 'case "listSessionsPage":', "runtime missing listSessionsPage switch case");
+        const start = src.indexOf('case "listSessionsPage":');
+        const caseBlock = src.slice(start, start + 300);
+        assertIncludes(caseBlock, "clampLimit(safeParams.limit, 50, 200)", "runtime must clamp listSessionsPage limit");
+        assertIncludes(caseBlock, "parseSessionPageCursor(safeParams.cursor)", "runtime must validate cursor shape");
     });
 
     it("has switch case for pruneTurnMetrics with required olderThan", () => {
@@ -132,6 +164,29 @@ describe("runtime.js — Phase 2 switch cases and date normalization", () => {
 
     it("still throws for unknown methods", () => {
         assertIncludes(src, 'throw new Error(`Unsupported portal RPC method: ${method}`)', "runtime default case must still throw");
+    });
+
+    it("has switch case for getSessionEvents with limit cap", () => {
+        assertIncludes(src, 'case "getSessionEvents":', "runtime missing getSessionEvents switch case");
+        const start = src.indexOf('case "getSessionEvents":');
+        const caseBlock = src.slice(start, start + 300);
+        assertIncludes(caseBlock, "clampLimit(safeParams.limit, 200, 500)", "runtime must clamp getSessionEvents limit");
+    });
+
+    it("has switch case for getSessionEventsBefore with limit cap", () => {
+        assertIncludes(src, 'case "getSessionEventsBefore":', "runtime missing getSessionEventsBefore switch case");
+        const start = src.indexOf('case "getSessionEventsBefore":');
+        const caseBlock = src.slice(start, start + 300);
+        assertIncludes(caseBlock, "clampLimit(safeParams.limit, 200, 500)", "runtime must clamp getSessionEventsBefore limit");
+    });
+
+    it("has switch case for getTopEventEmitters with required since and limit cap", () => {
+        assertIncludes(src, 'case "getTopEventEmitters":', "runtime missing getTopEventEmitters switch case");
+        const start = src.indexOf('case "getTopEventEmitters":');
+        const caseBlock = src.slice(start, start + 300);
+        assertIncludes(caseBlock, 'parseRequiredDate(safeParams.since, "since")', "runtime must require since for getTopEventEmitters");
+        assertIncludes(caseBlock, "enforceMaxWindowDays(", "runtime must enforce max window for getTopEventEmitters");
+        assertIncludes(caseBlock, "clampLimit(safeParams.limit, 20, 100)", "runtime must clamp getTopEventEmitters limit");
     });
 });
 
@@ -159,6 +214,10 @@ describe("PortalRuntime.call — behavioral routing for Phase 2 methods", () => 
             async getFleetDbCallMetrics(opts) {
                 calls.push({ method: "getFleetDbCallMetrics", opts });
                 return [{ ok: true }];
+            }
+            async listSessionsPage(params) {
+                calls.push({ method: "listSessionsPage", params });
+                return { items: [], hasMore: false };
             }
             async pruneTurnMetrics(olderThan) {
                 calls.push({ method: "pruneTurnMetrics", olderThan });
@@ -196,11 +255,18 @@ describe("PortalRuntime.call — behavioral routing for Phase 2 methods", () => 
             .toThrow('Invalid RPC parameter "olderThan"');
     });
 
-    it("routes optional since fields as undefined when omitted", async () => {
+    it("routes optional since fields with 30-day default when omitted", async () => {
         const { runtime, calls } = await makeRuntime();
         await runtime.call("getFleetTurnAnalytics", {});
         expect(calls[0].method).toBe("getFleetTurnAnalytics");
-        expect(calls[0].opts.since).toBeUndefined();
+        expect(calls[0].opts.since).toBeInstanceOf(Date);
+    });
+
+    it("routes listSessionsPage with clamped limit", async () => {
+        const { runtime, calls } = await makeRuntime();
+        await runtime.call("listSessionsPage", { limit: 9999 });
+        expect(calls[0].method).toBe("listSessionsPage");
+        expect(calls[0].params.limit).toBe(200);
     });
 });
 
@@ -208,6 +274,13 @@ describe("PortalRuntime.call — behavioral routing for Phase 2 methods", () => 
 
 describe("browser-transport.js — Phase 2 method signatures and RPC names", () => {
     const src = readRepoFile("packages/portal/src/browser-transport.js");
+
+    it("has listSessionsPage forwarding limit/cursor/includeDeleted", () => {
+        assertIncludes(src, "async listSessionsPage(params = {})", "browser transport missing listSessionsPage");
+        assertIncludes(src, 'this.rpc("listSessionsPage"', "browser transport must call rpc with listSessionsPage");
+        assertIncludes(src, "limit: params?.limit", "browser transport must forward limit");
+        assertIncludes(src, "includeDeleted: params?.includeDeleted", "browser transport must forward includeDeleted");
+    });
 
     it("has getSessionTurnMetrics forwarding since/limit", () => {
         assertIncludes(src, "async getSessionTurnMetrics(sessionId, opts)", "browser transport missing getSessionTurnMetrics");
@@ -238,6 +311,13 @@ describe("browser-transport.js — Phase 2 method signatures and RPC names", () 
         assertIncludes(src, "async pruneTurnMetrics(olderThan)", "browser transport missing pruneTurnMetrics");
         assertIncludes(src, 'this.rpc("pruneTurnMetrics"', "browser transport must call rpc with correct method name");
         assertIncludes(src, "olderThan instanceof Date ? olderThan.toISOString() : olderThan", "browser transport must serialize olderThan to ISO");
+    });
+
+    it("has getTopEventEmitters with required since serialization and limit forwarding", () => {
+        assertIncludes(src, "async getTopEventEmitters(params", "browser transport missing getTopEventEmitters");
+        assertIncludes(src, 'this.rpc("getTopEventEmitters"', "browser transport must call rpc with correct method name");
+        assertIncludes(src, "params.since instanceof Date ? params.since.toISOString() : params.since", "browser transport must serialize since to ISO");
+        assertIncludes(src, "limit: params.limit", "browser transport must forward limit");
     });
 });
 
@@ -333,7 +413,7 @@ describe("BrowserPortalTransport — functional RPC payload shape", () => {
         expect(rpcCalls[0].params.olderThan).toBe("2026-01-01T00:00:00.000Z");
     });
 
-    it("all five methods use the exact RPC method names matching runtime switch cases", async () => {
+    it("all five original methods use the exact RPC method names matching runtime switch cases", async () => {
         const { transport, rpcCalls } = await makeTransport();
         const d = new Date("2026-04-01T00:00:00.000Z");
         await transport.getSessionTurnMetrics("s");
@@ -350,21 +430,43 @@ describe("BrowserPortalTransport — functional RPC payload shape", () => {
             "pruneTurnMetrics",
         ]);
     });
+
+    it("getTopEventEmitters serializes since Date to ISO and forwards limit", async () => {
+        const { transport, rpcCalls } = await makeTransport();
+        const since = new Date("2026-04-25T00:00:00.000Z");
+        await transport.getTopEventEmitters({ since, limit: 50 });
+        expect(rpcCalls).toHaveLength(1);
+        expect(rpcCalls[0].method).toBe("getTopEventEmitters");
+        expect(rpcCalls[0].params.since).toBe("2026-04-25T00:00:00.000Z");
+        expect(rpcCalls[0].params.limit).toBe(50);
+    });
+
+    it("getTopEventEmitters passes undefined limit when not provided", async () => {
+        const { transport, rpcCalls } = await makeTransport();
+        const since = new Date("2026-04-28T00:00:00.000Z");
+        await transport.getTopEventEmitters({ since });
+        expect(rpcCalls[0].params.limit).toBeUndefined();
+        expect(rpcCalls[0].params.since).toBe("2026-04-28T00:00:00.000Z");
+    });
 });
 
 // ─── Cross-layer alignment check ─────────────────────────────────
 
 describe("cross-layer method name alignment", () => {
-    it("all five RPC names appear in all three layers", () => {
-        const runtime     = readRepoFile("packages/portal/runtime.js");
-        const nodeTransport = readRepoFile("packages/cli/src/node-sdk-transport.js");
+    it("all Phase 2 RPC names appear in all three layers", () => {
+        const runtime          = readRepoFile("packages/portal/runtime.js");
+        const nodeTransport    = readRepoFile("packages/cli/src/node-sdk-transport.js");
         const browserTransport = readRepoFile("packages/portal/src/browser-transport.js");
 
         const methods = [
+            "listSessionsPage",
+            "getSessionEvents",
+            "getSessionEventsBefore",
             "getSessionTurnMetrics",
             "getFleetTurnAnalytics",
             "getHourlyTokenBuckets",
             "getFleetDbCallMetrics",
+            "getTopEventEmitters",
             "pruneTurnMetrics",
         ];
 

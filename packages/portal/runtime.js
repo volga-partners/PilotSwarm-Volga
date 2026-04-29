@@ -4,10 +4,16 @@ function normalizeParams(params) {
     return params && typeof params === "object" ? params : {};
 }
 
-function parseOptionalDate(value) {
+function parseOptionalDate(value, fieldName) {
     if (!value) return undefined;
     const parsed = new Date(value);
-    return Number.isNaN(parsed.getTime()) ? undefined : parsed;
+    if (Number.isNaN(parsed.getTime())) {
+        if (fieldName) {
+            throw new Error(`Invalid RPC parameter "${fieldName}": expected ISO date value`);
+        }
+        return undefined;
+    }
+    return parsed;
 }
 
 function parseRequiredDate(value, fieldName) {
@@ -19,6 +25,60 @@ function parseRequiredDate(value, fieldName) {
         throw new Error(`Invalid RPC parameter "${fieldName}": expected ISO date value`);
     }
     return parsed;
+}
+
+export function clampInt(value, fallback, min, max) {
+    const n = typeof value === "number" ? value : parseInt(value, 10);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(max, Math.max(min, n));
+}
+
+export function clampLimit(value, fallback, max) {
+    return clampInt(value, fallback, 1, max);
+}
+
+export function enforceMaxWindowDays(date, maxDays, fieldName) {
+    if (date === undefined || date === null) return date;
+    const cutoff = new Date(Date.now() - maxDays * 24 * 60 * 60 * 1000);
+    if (date < cutoff) {
+        throw new Error(`Invalid RPC parameter "${fieldName}": must be within the last ${maxDays} days`);
+    }
+    return date;
+}
+
+function defaultSinceDays(date, maxDays) {
+    if (date !== undefined && date !== null) return date;
+    return new Date(Date.now() - maxDays * 24 * 60 * 60 * 1000);
+}
+
+function parseSessionPageCursor(value) {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "object") {
+        throw new Error('Invalid RPC parameter "cursor": expected object');
+    }
+
+    const updatedAt = value.updatedAt;
+    const sessionId = value.sessionId;
+    const hasUpdatedAt = updatedAt !== undefined && updatedAt !== null && String(updatedAt).trim() !== "";
+    const hasSessionId = sessionId !== undefined && sessionId !== null && String(sessionId).trim() !== "";
+
+    if (!hasUpdatedAt && !hasSessionId) {
+        throw new Error('Invalid RPC parameter "cursor": must include both "updatedAt" and "sessionId"');
+    }
+    if (hasUpdatedAt !== hasSessionId) {
+        throw new Error('Invalid RPC parameter "cursor": must include both "updatedAt" and "sessionId"');
+    }
+
+    const parsedUpdatedAt = parseRequiredDate(updatedAt, "cursor.updatedAt");
+    const parsedSessionId = String(sessionId).trim();
+    if (!parsedSessionId) {
+        throw new Error('Invalid RPC parameter "cursor.sessionId": expected non-empty string');
+    }
+
+    return {
+        updatedAt: parsedUpdatedAt.toISOString(),
+        sessionId: parsedSessionId,
+    };
 }
 
 export class PortalRuntime {
@@ -85,6 +145,12 @@ export class PortalRuntime {
         switch (method) {
             case "listSessions":
                 return this.transport.listSessions();
+            case "listSessionsPage":
+                return this.transport.listSessionsPage({
+                    limit: clampLimit(safeParams.limit, 50, 200),
+                    includeDeleted: safeParams.includeDeleted,
+                    cursor: parseSessionPageCursor(safeParams.cursor),
+                });
             case "getSession":
                 return this.transport.getSession(safeParams.sessionId);
             case "getOrchestrationStats":
@@ -129,17 +195,20 @@ export class PortalRuntime {
             case "getSessionTurnMetrics":
                 return this.transport.getSessionTurnMetrics(safeParams.sessionId, {
                     since: parseOptionalDate(safeParams.since),
-                    limit: safeParams.limit,
+                    limit: clampLimit(safeParams.limit, 100, 500),
                 });
             case "getFleetTurnAnalytics":
-                return this.transport.getFleetTurnAnalytics({
-                    since: parseOptionalDate(safeParams.since),
-                    agentId: safeParams.agentId,
-                    model: safeParams.model,
-                });
+                {
+                    const since = defaultSinceDays(parseOptionalDate(safeParams.since, "since"), 30);
+                    return this.transport.getFleetTurnAnalytics({
+                        since: enforceMaxWindowDays(since, 30, "since"),
+                        agentId: safeParams.agentId,
+                        model: safeParams.model,
+                    });
+                }
             case "getHourlyTokenBuckets":
                 return this.transport.getHourlyTokenBuckets(
-                    parseRequiredDate(safeParams.since, "since"),
+                    enforceMaxWindowDays(parseRequiredDate(safeParams.since, "since"), 30, "since"),
                     {
                         agentId: safeParams.agentId,
                         model: safeParams.model,
@@ -147,7 +216,12 @@ export class PortalRuntime {
                 );
             case "getFleetDbCallMetrics":
                 return this.transport.getFleetDbCallMetrics({
-                    since: parseOptionalDate(safeParams.since),
+                    since: enforceMaxWindowDays(defaultSinceDays(parseOptionalDate(safeParams.since, "since"), 30), 30, "since"),
+                });
+            case "getTopEventEmitters":
+                return this.transport.getTopEventEmitters({
+                    since: enforceMaxWindowDays(parseRequiredDate(safeParams.since, "since"), 30, "since"),
+                    limit: clampLimit(safeParams.limit, 20, 100),
                 });
             case "pruneTurnMetrics":
                 return this.transport.pruneTurnMetrics(parseRequiredDate(safeParams.olderThan, "olderThan"));
@@ -198,9 +272,17 @@ export class PortalRuntime {
             case "getDefaultModel":
                 return this.transport.getDefaultModel();
             case "getSessionEvents":
-                return this.transport.getSessionEvents(safeParams.sessionId, safeParams.afterSeq, safeParams.limit);
+                return this.transport.getSessionEvents(
+                    safeParams.sessionId,
+                    safeParams.afterSeq,
+                    clampLimit(safeParams.limit, 200, 500),
+                );
             case "getSessionEventsBefore":
-                return this.transport.getSessionEventsBefore(safeParams.sessionId, safeParams.beforeSeq, safeParams.limit);
+                return this.transport.getSessionEventsBefore(
+                    safeParams.sessionId,
+                    safeParams.beforeSeq,
+                    clampLimit(safeParams.limit, 200, 500),
+                );
             case "getLogConfig":
                 return this.transport.getLogConfig();
             case "getWorkerCount":

@@ -49,6 +49,21 @@ export interface SessionRow {
     splash: string | null;
 }
 
+/** Opaque cursor for keyset-paginated session listing. */
+export interface SessionPageCursor {
+    /** ISO timestamp of the last item on the current page. */
+    updatedAt: string;
+    /** Session ID of the last item on the current page (tie-breaker). */
+    sessionId: string;
+}
+
+/** Result of a paginated session list call. */
+export interface SessionPage {
+    items: SessionRow[];
+    nextCursor?: SessionPageCursor;
+    hasMore: boolean;
+}
+
 /** Fields that can be updated on a session row. */
 export interface SessionRowUpdates {
     orchestrationId?: string | null;
@@ -334,6 +349,15 @@ export interface FleetDbCallMetricRow {
     errorRate: number;
 }
 
+export interface TopEventEmitterRow {
+    workerNodeId: string;
+    eventType:    string;
+    eventCount:   number;
+    sessionCount: number;
+    firstSeenAt:  Date;
+    lastSeenAt:   Date;
+}
+
 // ─── Provider Interface ──────────────────────────────────────────
 
 /**
@@ -361,6 +385,9 @@ export interface SessionCatalogProvider {
 
     /** List all non-deleted sessions, newest first. */
     listSessions(): Promise<SessionRow[]>;
+
+    /** Keyset-paginated session listing. Stable order: updated_at DESC, session_id DESC. */
+    listSessionsPage(params?: { limit?: number; cursor?: SessionPageCursor; includeDeleted?: boolean }): Promise<SessionPage>;
 
     /** Get a single session by ID (null if not found or deleted). */
     getSession(sessionId: string): Promise<SessionRow | null>;
@@ -431,6 +458,9 @@ export interface SessionCatalogProvider {
     /** Fleet-wide DB call metrics aggregated from db_call_metric_buckets. */
     getFleetDbCallMetrics(opts?: { since?: Date }): Promise<FleetDbCallMetricRow[]>;
 
+    /** Top (worker_node_id, event_type) pairs by event count within the given window. */
+    getTopEventEmitters(params: { since: Date; limit?: number }): Promise<TopEventEmitterRow[]>;
+
     /** Cleanup / close connections. */
     close(): Promise<void>;
 }
@@ -441,12 +471,54 @@ const DEFAULT_SCHEMA = "copilot_sessions";
 export const SESSION_EVENTS_NOTIFY_CHANNEL = "session_events";
 const DEFAULT_DB_POOL_MAX = 10;
 const DEFAULT_EVENT_FETCH_LIMIT = 200;
+const DEFAULT_PG_QUERY_TIMEOUT_MS = 15_000;
+const DEFAULT_PG_CONNECTION_TIMEOUT_MS = 5_000;
+const DEFAULT_PG_IDLE_TIMEOUT_MS = 30_000;
 
-function resolveDbPoolMax(defaultMax = DEFAULT_DB_POOL_MAX): number {
-    const raw = process.env.DB_POOL_MAX;
-    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-    if (!Number.isFinite(parsed) || parsed <= 0) return defaultMax;
+/**
+ * Parse a positive integer from an env-style record, returning `defaultVal`
+ * on missing/invalid/below-`minVal` input.
+ */
+function resolveEnvInt(
+    varName: string,
+    defaultVal: number,
+    env: Record<string, string | undefined> = process.env,
+    minVal = 0,
+): number {
+    const raw = env[varName];
+    if (!raw) return defaultVal;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < minVal) return defaultVal;
     return parsed;
+}
+
+/**
+ * Build pg Pool guardrail options from env vars.
+ * Accepts an optional `env` record so tests can inject values without
+ * mutating `process.env`.
+ *
+ * Env vars:
+ *   DB_POOL_MAX               – max pool connections (default 10, min 1)
+ *   PG_CONNECTION_TIMEOUT_MS  – connection timeout in ms (default 5000; 0 = no limit)
+ *   PG_IDLE_TIMEOUT_MS        – idle client timeout in ms (default 30000; 0 = no limit)
+ *   PG_QUERY_TIMEOUT_MS       – library-side query cancel in ms (default 15000; 0 = no limit)
+ *   PG_STATEMENT_TIMEOUT_MS   – DB-side statement_timeout in ms (default 0 = disabled)
+ */
+export function buildPgGuardrailConfig(env: Record<string, string | undefined> = process.env): {
+    max: number;
+    connectionTimeoutMillis: number;
+    idleTimeoutMillis: number;
+    query_timeout: number;
+    statement_timeout?: number;
+} {
+    const stmtTimeout = resolveEnvInt("PG_STATEMENT_TIMEOUT_MS", 0, env);
+    return {
+        max: resolveEnvInt("DB_POOL_MAX", DEFAULT_DB_POOL_MAX, env, 1),
+        connectionTimeoutMillis: resolveEnvInt("PG_CONNECTION_TIMEOUT_MS", DEFAULT_PG_CONNECTION_TIMEOUT_MS, env),
+        idleTimeoutMillis: resolveEnvInt("PG_IDLE_TIMEOUT_MS", DEFAULT_PG_IDLE_TIMEOUT_MS, env),
+        query_timeout: resolveEnvInt("PG_QUERY_TIMEOUT_MS", DEFAULT_PG_QUERY_TIMEOUT_MS, env),
+        ...(stmtTimeout > 0 ? { statement_timeout: stmtTimeout } : {}),
+    };
 }
 
 export function buildPgConnectionConfig(connectionString: string): {
@@ -489,6 +561,7 @@ function sqlForSchema(schema: string) {
             updateSession:              `${s}.cms_update_session`,
             softDeleteSession:          `${s}.cms_soft_delete_session`,
             listSessions:               `${s}.cms_list_sessions`,
+            listSessionsPage:           `${s}.cms_list_sessions_page`,
             getSession:                 `${s}.cms_get_session`,
             getDescendantSessionIds:    `${s}.cms_get_descendant_session_ids`,
             getLastSessionId:           `${s}.cms_get_last_session_id`,
@@ -512,6 +585,7 @@ function sqlForSchema(schema: string) {
             pruneTurnMetrics:                 `${s}.cms_prune_turn_metrics`,
             upsertDbCallMetricBucketBatch:    `${s}.cms_upsert_db_call_metric_bucket_batch`,
             getFleetDbCallMetrics:            `${s}.cms_get_fleet_db_call_metrics`,
+            getTopEventEmitters:              `${s}.cms_get_top_event_emitters`,
         },
     };
 }
@@ -549,7 +623,7 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
         const { default: pg } = await import("pg");
 
         const pool = new pg.Pool({
-            max: resolveDbPoolMax(),
+            ...buildPgGuardrailConfig(),
             ...buildPgConnectionConfig(connectionString),
         });
 
@@ -631,6 +705,30 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
                 `SELECT * FROM ${this.sql.fn.listSessions}()`,
             );
             return rows.map(rowToSessionRow);
+        });
+    }
+
+    async listSessionsPage(params?: { limit?: number; cursor?: SessionPageCursor; includeDeleted?: boolean }): Promise<SessionPage> {
+        return measureDbCall("cms.listSessionsPage", async () => {
+            const limit = Math.min(200, Math.max(1, params?.limit ?? 50));
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.listSessionsPage}($1, $2, $3, $4)`,
+                [
+                    limit + 1,
+                    params?.cursor?.updatedAt ?? null,
+                    params?.cursor?.sessionId ?? null,
+                    params?.includeDeleted ?? false,
+                ],
+            );
+            const hasMore = rows.length > limit;
+            const items = rows.slice(0, limit).map(rowToSessionRow);
+            const nextCursor: SessionPageCursor | undefined = hasMore
+                ? {
+                    updatedAt: items[items.length - 1].updatedAt.toISOString(),
+                    sessionId: items[items.length - 1].sessionId,
+                }
+                : undefined;
+            return { items, nextCursor, hasMore };
         });
     }
 
@@ -1041,6 +1139,17 @@ export class PgSessionCatalogProvider implements SessionCatalogProvider {
         });
     }
 
+    async getTopEventEmitters(params: { since: Date; limit?: number }): Promise<TopEventEmitterRow[]> {
+        return measureDbCall("cms.getTopEventEmitters", async () => {
+            const limit = Math.min(100, Math.max(1, params.limit ?? 20));
+            const { rows } = await this.pool.query(
+                `SELECT * FROM ${this.sql.fn.getTopEventEmitters}($1, $2)`,
+                [params.since, limit],
+            );
+            return rows.map(rowToTopEventEmitterRow);
+        });
+    }
+
     async close(): Promise<void> {
         if (this.pool) {
             await this.pool.end();
@@ -1195,5 +1304,17 @@ function rowToFleetDbCallMetricRow(row: any): FleetDbCallMetricRow {
         totalMs:   Number(row.total_ms) || 0,
         avgMs:     Number(row.avg_ms) || 0,
         errorRate: Number(row.error_rate) || 0,
+    };
+}
+
+/** Map a PG row to TopEventEmitterRow. */
+function rowToTopEventEmitterRow(row: any): TopEventEmitterRow {
+    return {
+        workerNodeId: String(row.worker_node_id),
+        eventType:    String(row.event_type),
+        eventCount:   Number(row.event_count),
+        sessionCount: Number(row.session_count),
+        firstSeenAt:  new Date(row.first_seen_at),
+        lastSeenAt:   new Date(row.last_seen_at),
     };
 }

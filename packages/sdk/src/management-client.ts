@@ -35,6 +35,7 @@ import type {
     FleetTurnAnalyticsRow,
     HourlyTokenBucketRow,
     FleetDbCallMetricRow,
+    TopEventEmitterRow,
 } from "./cms.js";
 import { DbMetricsReporter, makeProcessId, makeProcessRole } from "./db-metrics-reporter.js";
 import type { FactStore, FactsStatsRow } from "./facts-store.js";
@@ -200,6 +201,15 @@ export interface ExecutionHistoryEvent {
     timestampMs: number;
     data?: string;
 }
+
+/** Paginated result of a session list call. */
+export interface SessionListPage {
+    items: PilotSwarmSessionView[];
+    nextCursor?: { updatedAt: string; sessionId: string };
+    hasMore: boolean;
+}
+
+type SessionPageParams = Parameters<SessionCatalogProvider["listSessionsPage"]>[0];
 
 /** Options for PilotSwarmManagementClient. */
 export interface PilotSwarmManagementClientOptions {
@@ -472,6 +482,41 @@ export class PilotSwarmManagementClient {
     }
 
     /**
+     * Keyset-paginated session listing. Caller controls page size (default 50, max 200).
+     * Pass the returned `nextCursor` from one page as `params.cursor` to fetch the next.
+     * `hasMore: false` signals the last page. Stable order: `updated_at DESC, session_id DESC`.
+     */
+    async listSessionsPage(params?: SessionPageParams): Promise<SessionListPage> {
+        this._ensureStarted();
+        const page = await this._catalog!.listSessionsPage(params);
+        return {
+            items: page.items.map((row) => {
+                const status: PilotSwarmSessionStatus = (row.state as PilotSwarmSessionStatus) || "pending";
+                return {
+                    sessionId: row.sessionId,
+                    title: row.title ?? undefined,
+                    agentId: row.agentId ?? undefined,
+                    splash: row.splash ?? undefined,
+                    status,
+                    orchestrationStatus: undefined,
+                    orchestrationVersion: undefined,
+                    createdAt: row.createdAt.getTime(),
+                    updatedAt: row.updatedAt?.getTime(),
+                    iterations: row.currentIteration ?? 0,
+                    parentSessionId: row.parentSessionId ?? undefined,
+                    isSystem: row.isSystem || undefined,
+                    model: row.model ?? undefined,
+                    error: row.lastError ?? undefined,
+                    waitReason: row.waitReason ?? undefined,
+                    statusVersion: undefined,
+                };
+            }),
+            nextCursor: page.nextCursor,
+            hasMore: page.hasMore,
+        };
+    }
+
+    /**
      * Get a single session view by ID.
      */
     async getSession(sessionId: string): Promise<PilotSwarmSessionView | null> {
@@ -736,6 +781,7 @@ export class PilotSwarmManagementClient {
         return this._catalog!.getSessionEvents(sessionId, afterSeq, limit);
     }
 
+    /** Get the `limit` events immediately preceding `beforeSeq` for a session (default 200, max 500). */
     async getSessionEventsBefore(sessionId: string, beforeSeq: number, limit?: number): Promise<import("./cms.js").SessionEvent[]> {
         this._ensureStarted();
         return this._catalog!.getSessionEventsBefore(sessionId, beforeSeq, limit);
@@ -999,6 +1045,17 @@ export class PilotSwarmManagementClient {
         this._ensureStarted();
         if (!this._catalog) return [];
         return this._catalog.getFleetDbCallMetrics(opts);
+    }
+
+    /**
+     * Top (worker_node_id, event_type) pairs ranked by event count within the given window.
+     * `since` is required; max lookback 30 days. Returns default 20, max 100 rows.
+     * Returns [] when running without a PostgreSQL CMS.
+     */
+    async getTopEventEmitters(params: { since: Date; limit?: number }): Promise<TopEventEmitterRow[]> {
+        this._ensureStarted();
+        if (!this._catalog) return [];
+        return this._catalog.getTopEventEmitters(params);
     }
 
     /**

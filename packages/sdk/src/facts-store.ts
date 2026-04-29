@@ -97,11 +97,15 @@ export interface FactStore {
 
 const DEFAULT_SCHEMA = "pilotswarm_facts";
 const DEFAULT_DB_POOL_MAX = 10;
+const DEFAULT_PG_QUERY_TIMEOUT_MS = 15_000;
+const DEFAULT_PG_CONNECTION_TIMEOUT_MS = 5_000;
+const DEFAULT_PG_IDLE_TIMEOUT_MS = 30_000;
 
-function resolveDbPoolMax(defaultMax = DEFAULT_DB_POOL_MAX): number {
-    const raw = process.env.DB_POOL_MAX;
-    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
-    if (!Number.isFinite(parsed) || parsed <= 0) return defaultMax;
+function resolveEnvInt(varName: string, defaultVal: number, env: Record<string, string | undefined> = process.env, minVal = 0): number {
+    const raw = env[varName];
+    if (!raw) return defaultVal;
+    const parsed = Number.parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < minVal) return defaultVal;
     return parsed;
 }
 
@@ -161,9 +165,14 @@ export class PgFactStore implements FactStore {
             .includes(parsed.searchParams.get("sslmode") ?? "");
         parsed.searchParams.delete("sslmode");
 
+        const stmtTimeout = resolveEnvInt("PG_STATEMENT_TIMEOUT_MS", 0);
         const pool = new pg.Pool({
             connectionString: parsed.toString(),
-            max: resolveDbPoolMax(),
+            max: resolveEnvInt("DB_POOL_MAX", DEFAULT_DB_POOL_MAX, undefined, 1),
+            connectionTimeoutMillis: resolveEnvInt("PG_CONNECTION_TIMEOUT_MS", DEFAULT_PG_CONNECTION_TIMEOUT_MS),
+            idleTimeoutMillis: resolveEnvInt("PG_IDLE_TIMEOUT_MS", DEFAULT_PG_IDLE_TIMEOUT_MS),
+            query_timeout: resolveEnvInt("PG_QUERY_TIMEOUT_MS", DEFAULT_PG_QUERY_TIMEOUT_MS),
+            ...(stmtTimeout > 0 ? { statement_timeout: stmtTimeout } : {}),
             ...(needsSsl ? { ssl: { rejectUnauthorized: false } } : {}),
         });
 

@@ -70,6 +70,21 @@ export function CMS_MIGRATIONS(schema: string): MigrationEntry[] {
             name: "turn_metrics_and_db_buckets",
             sql: migration_0010_turn_metrics_and_db_buckets(schema),
         },
+        {
+            version: "0011",
+            name: "list_sessions_page",
+            sql: migration_0011_list_sessions_page(schema),
+        },
+        {
+            version: "0012",
+            name: "sql_read_bounds",
+            sql: migration_0012_sql_read_bounds(schema),
+        },
+        {
+            version: "0013",
+            name: "top_event_emitters",
+            sql: migration_0013_top_event_emitters(schema),
+        },
     ];
 }
 
@@ -1392,6 +1407,178 @@ BEGIN
     WHERE (p_since IS NULL OR b.bucket_minute >= p_since)
     GROUP BY b.method
     ORDER BY SUM(b.calls) DESC;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0011: List Sessions Page ──────────────────────────
+
+function migration_0011_list_sessions_page(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+-- ── cms_list_sessions_page ────────────────────────────────────────
+-- Keyset-paginated session listing ordered by updated_at DESC, session_id DESC.
+-- Caller passes limit+1 so TypeScript can detect hasMore without a count query.
+-- SQL cap: GREATEST(1, LEAST(COALESCE(p_limit, 51), 201)) — NULL-safe defence-in-depth.
+CREATE OR REPLACE FUNCTION ${s}.cms_list_sessions_page(
+    p_limit             INT         DEFAULT 51,
+    p_cursor_updated_at TIMESTAMPTZ DEFAULT NULL,
+    p_cursor_session_id TEXT        DEFAULT NULL,
+    p_include_deleted   BOOL        DEFAULT FALSE
+) RETURNS SETOF ${s}.sessions AS $$
+DECLARE
+    v_limit INT := GREATEST(1, LEAST(COALESCE(p_limit, 51), 201));
+BEGIN
+    RETURN QUERY
+    SELECT * FROM ${s}.sessions s
+    WHERE
+        (p_include_deleted OR s.deleted_at IS NULL)
+        AND (
+            p_cursor_updated_at IS NULL
+            OR s.updated_at < p_cursor_updated_at
+            OR (s.updated_at = p_cursor_updated_at AND s.session_id < p_cursor_session_id)
+        )
+    ORDER BY s.updated_at DESC, s.session_id DESC
+    LIMIT v_limit;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0012: SQL Read Bounds ─────────────────────────────
+
+function migration_0012_sql_read_bounds(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+-- Defence-in-depth: enforce server-side read limits on the three high-volume
+-- read functions so a bypassed app-layer cap cannot cause runaway transfers.
+-- All three use: v_limit := GREATEST(1, LEAST(COALESCE(p_limit, 200), 500))
+
+-- ── 1. cms_get_session_events (bounded) ──────────────────────────
+CREATE OR REPLACE FUNCTION ${s}.cms_get_session_events(
+    p_session_id TEXT,
+    p_after_seq  BIGINT,
+    p_limit      INT
+) RETURNS SETOF ${s}.session_events AS $$
+DECLARE
+    v_limit INT := GREATEST(1, LEAST(COALESCE(p_limit, 200), 500));
+BEGIN
+    IF p_after_seq IS NOT NULL AND p_after_seq > 0 THEN
+        RETURN QUERY
+        SELECT * FROM ${s}.session_events
+        WHERE session_id = p_session_id AND seq > p_after_seq
+        ORDER BY seq ASC LIMIT v_limit;
+    ELSE
+        RETURN QUERY
+        SELECT * FROM (
+            SELECT * FROM ${s}.session_events
+            WHERE session_id = p_session_id
+            ORDER BY seq DESC LIMIT v_limit
+        ) t ORDER BY seq ASC;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 2. cms_get_session_events_before (bounded) ───────────────────
+CREATE OR REPLACE FUNCTION ${s}.cms_get_session_events_before(
+    p_session_id  TEXT,
+    p_before_seq  BIGINT,
+    p_limit       INT
+) RETURNS SETOF ${s}.session_events AS $$
+DECLARE
+    v_limit INT := GREATEST(1, LEAST(COALESCE(p_limit, 200), 500));
+BEGIN
+    RETURN QUERY
+    SELECT * FROM (
+        SELECT * FROM ${s}.session_events
+        WHERE session_id = p_session_id AND seq < p_before_seq
+        ORDER BY seq DESC LIMIT v_limit
+    ) t ORDER BY seq ASC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ── 3. cms_get_session_turn_metrics (bounded) ────────────────────
+CREATE OR REPLACE FUNCTION ${s}.cms_get_session_turn_metrics(
+    p_session_id TEXT,
+    p_since      TIMESTAMPTZ DEFAULT NULL,
+    p_limit      INT         DEFAULT 200
+) RETURNS TABLE (
+    id                  BIGINT,
+    session_id          TEXT,
+    agent_id            TEXT,
+    model               TEXT,
+    turn_index          INT,
+    started_at          TIMESTAMPTZ,
+    ended_at            TIMESTAMPTZ,
+    duration_ms         INT,
+    tokens_input        BIGINT,
+    tokens_output       BIGINT,
+    tokens_cache_read   BIGINT,
+    tokens_cache_write  BIGINT,
+    tool_calls          INT,
+    tool_errors         INT,
+    result_type         TEXT,
+    error_message       TEXT,
+    worker_node_id      TEXT,
+    created_at          TIMESTAMPTZ
+) AS $$
+DECLARE
+    v_limit INT := GREATEST(1, LEAST(COALESCE(p_limit, 200), 500));
+BEGIN
+    RETURN QUERY
+    SELECT
+        t.id, t.session_id, t.agent_id, t.model, t.turn_index,
+        t.started_at, t.ended_at, t.duration_ms,
+        t.tokens_input, t.tokens_output, t.tokens_cache_read, t.tokens_cache_write,
+        t.tool_calls, t.tool_errors, t.result_type, t.error_message,
+        t.worker_node_id, t.created_at
+    FROM ${s}.session_turn_metrics t
+    WHERE t.session_id = p_session_id
+      AND (p_since IS NULL OR t.started_at >= p_since)
+    ORDER BY t.turn_index DESC, t.id DESC
+    LIMIT v_limit;
+END;
+$$ LANGUAGE plpgsql;
+`;
+}
+
+// ─── Migration 0013: Top Event Emitters ──────────────────────────
+
+function migration_0013_top_event_emitters(schema: string): string {
+    const s = `"${schema}"`;
+    return `
+-- 0013_top_event_emitters: diagnostics function to identify noisy event
+-- emitters by (worker_node_id, event_type) within a given time window.
+
+CREATE OR REPLACE FUNCTION ${s}.cms_get_top_event_emitters(
+    p_since TIMESTAMPTZ,
+    p_limit INT
+) RETURNS TABLE (
+    worker_node_id TEXT,
+    event_type     TEXT,
+    event_count    BIGINT,
+    session_count  BIGINT,
+    first_seen_at  TIMESTAMPTZ,
+    last_seen_at   TIMESTAMPTZ
+) AS $$
+DECLARE
+    v_limit INT := GREATEST(1, LEAST(COALESCE(p_limit, 20), 100));
+BEGIN
+    RETURN QUERY
+    SELECT
+        se.worker_node_id,
+        se.event_type,
+        COUNT(*)::BIGINT                      AS event_count,
+        COUNT(DISTINCT se.session_id)::BIGINT AS session_count,
+        MIN(se.created_at)                    AS first_seen_at,
+        MAX(se.created_at)                    AS last_seen_at
+    FROM ${s}.session_events se
+    WHERE se.worker_node_id IS NOT NULL
+      AND se.created_at >= COALESCE(p_since, now() - INTERVAL '24 hours')
+    GROUP BY se.worker_node_id, se.event_type
+    ORDER BY event_count DESC, last_seen_at DESC
+    LIMIT v_limit;
 END;
 $$ LANGUAGE plpgsql;
 `;

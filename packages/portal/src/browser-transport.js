@@ -198,6 +198,19 @@ export class BrowserPortalTransport {
         return this.rpc("listSessions");
     }
 
+    async listSessionsPage(params = {}) {
+        return this.rpc("listSessionsPage", {
+            limit: params?.limit,
+            includeDeleted: params?.includeDeleted,
+            cursor: params?.cursor
+                ? {
+                    updatedAt: params.cursor.updatedAt,
+                    sessionId: params.cursor.sessionId,
+                }
+                : undefined,
+        });
+    }
+
     async getSession(sessionId) {
         return this.rpc("getSession", { sessionId });
     }
@@ -298,6 +311,13 @@ export class BrowserPortalTransport {
     async getFleetDbCallMetrics(opts) {
         return this.rpc("getFleetDbCallMetrics", {
             since: opts?.since instanceof Date ? opts.since.toISOString() : opts?.since,
+        });
+    }
+
+    async getTopEventEmitters(params = {}) {
+        return this.rpc("getTopEventEmitters", {
+            since: params.since instanceof Date ? params.since.toISOString() : params.since,
+            limit: params.limit,
         });
     }
 
