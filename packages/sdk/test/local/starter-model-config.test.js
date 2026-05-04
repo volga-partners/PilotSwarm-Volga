@@ -18,14 +18,14 @@ describe("starter docker model config", () => {
 
         const names = provider.models.map((model) => typeof model === "string" ? model : model.name);
 
-        expect(config.defaultModel).toBe("github-copilot:claude-sonnet-4.6");
+        expect(config.defaultModel).toBe("github-copilot:gpt-5.4-mini");
         expect(names).toEqual([
-            "claude-sonnet-4.6",
             "gpt-5.4",
             "gpt-5.4-mini",
-            "claude-opus-4.7",
-            "claude-opus-4.6",
         ]);
+        expect(names).not.toContain("claude-sonnet-4.6");
+        expect(names).not.toContain("claude-opus-4.7");
+        expect(names).not.toContain("claude-opus-4.6");
         expect(names).not.toContain("gpt-5-mini");
         expect(names).not.toContain("gpt-5.4-nano");
         expect(names).not.toContain("gpt-5.1");

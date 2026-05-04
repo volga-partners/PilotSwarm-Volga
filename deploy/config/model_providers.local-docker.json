@@ -6,11 +6,6 @@
             "githubToken": "env:GITHUB_TOKEN",
             "models": [
                 {
-                    "name": "claude-sonnet-4.6",
-                    "description": "Claude Sonnet 4.6. Balanced default for everyday coding, chat, and multi-step work in the local starter appliance.",
-                    "cost": "medium"
-                },
-                {
                     "name": "gpt-5.4",
                     "description": "GPT-5.4. Strong flagship GPT option for harder reasoning, planning, and coding tasks through GitHub Copilot.",
                     "cost": "high"
@@ -19,19 +14,9 @@
                     "name": "gpt-5.4-mini",
                     "description": "GPT-5.4 Mini. Faster, lighter-weight GPT option for everyday chat, drafting, and cheaper iteration in the local starter appliance.",
                     "cost": "low"
-                },
-                {
-                    "name": "claude-opus-4.7",
-                    "description": "Claude Opus 4.7 (latest). Most capable Claude option for the hardest analysis and reasoning tasks in the starter appliance.",
-                    "cost": "high"
-                },
-                {
-                    "name": "claude-opus-4.6",
-                    "description": "Claude Opus 4.6. Most capable option for deeper analysis and harder tasks in the starter appliance.",
-                    "cost": "high"
                 }
             ]
         }
     ],
-    "defaultModel": "github-copilot:claude-sonnet-4.6"
+    "defaultModel": "github-copilot:gpt-5.4-mini"
 }
