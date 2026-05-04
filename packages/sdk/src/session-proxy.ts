@@ -16,6 +16,8 @@ import {
     isHighRiskTurnResult,
     shouldRunPromptGuardrailDetector,
 } from "./prompt-guardrails.js";
+import { applyAssistantOutputBudget, applyTurnBudget, buildTurnBudgetConfig } from "./turn-budget.js";
+import { routeTurn, isModelFallbackEligibleError } from "./model-routing.js";
 import os from "node:os";
 import fs from "node:fs";
 
@@ -509,6 +511,23 @@ export function registerActivities(
         }
 
         const runConfig = buildRunTurnConfig(input.config, hostname, fallbackAgentIdentity);
+
+        // Model routing: classify this turn and resolve an ordered candidate chain.
+        const routeDecision = routeTurn({
+            model: runConfig.model,
+            agentIdentity: runConfig.agentIdentity,
+            promptLayeringKind: runConfig.promptLayering?.kind,
+            isBootstrap: input.bootstrap,
+            prompt: input.prompt,
+        }, sessionManager.getModelRegistry());
+        if (!routeDecision.isExplicitOverride && routeDecision.primary) {
+            runConfig.model = routeDecision.primary;
+        }
+        activityCtx.traceInfo(
+            `[runTurn] model.route category=${routeDecision.category} primary=${routeDecision.primary ?? "none"} ` +
+            `override=${routeDecision.isExplicitOverride} candidates=${routeDecision.candidates.length}`,
+        );
+
         const trace = activityTrace(activityCtx, "runTurn");
 
         const failForMissingState = async (message: string) => {
@@ -1160,7 +1179,37 @@ export function registerActivities(
                     bootstrap: input.bootstrap,
                     requiredTool: input.requiredTool,
                     controlToolBridge,
+                    artifactStore: sessionManager.getArtifactStore(),
                 });
+            };
+            const turnBudgetConfig = buildTurnBudgetConfig();
+            let shouldFastFailOversizedPrompt = false;
+            const budgetPromptForTurn = (candidatePrompt: string, source: string): string => {
+                const budgeted = applyTurnBudget(candidatePrompt, turnBudgetConfig);
+                if (budgeted.decision !== "ok") {
+                    activityCtx.traceInfo(
+                        `[runTurn] prompt budget ${budgeted.decision} source=${source} ` +
+                        `originalChars=${budgeted.originalChars} effectiveChars=${budgeted.effectiveChars}`,
+                    );
+                    if (!input.bootstrap) {
+                        bufferCmsEvent("session.turn_budget", {
+                            stage: "prompt",
+                            source,
+                            decision: budgeted.decision,
+                            originalChars: budgeted.originalChars,
+                            effectiveChars: budgeted.effectiveChars,
+                        });
+                    }
+                    if (
+                        source === "primary"
+                        && budgeted.decision === "hard"
+                        && turnBudgetConfig.hardBudgetChars > 0
+                        && budgeted.originalChars > (turnBudgetConfig.hardBudgetChars * 3)
+                    ) {
+                        shouldFastFailOversizedPrompt = true;
+                    }
+                }
+                return budgeted.text;
             };
 
             // ── Prompt guardrail screening ──
@@ -1221,8 +1270,67 @@ export function registerActivities(
             const finalPrompt = effectivePrompt === input.prompt
                 ? guardedPrompt
                 : mergePromptSections([LOSSY_SESSION_REPLAY_NOTICE, guardedPrompt]) || guardedPrompt;
+            const boundedPrompt = budgetPromptForTurn(finalPrompt, "primary");
+            if (shouldFastFailOversizedPrompt) {
+                const refusal =
+                    "Your request is too large to process safely in one turn. " +
+                    "Please narrow the scope (or split it into smaller steps) and try again.";
+                if (!input.bootstrap) {
+                    bufferCmsEvent("session.turn_budget_fast_fail", {
+                        stage: "prompt",
+                        reason: "extreme_oversize",
+                        hardBudgetChars: turnBudgetConfig.hardBudgetChars,
+                    });
+                    bufferCmsEvent("assistant.message", { content: refusal });
+                }
+                return await finalizeTurn({
+                    type: "completed",
+                    content: refusal,
+                    events: [
+                        {
+                            eventType: "session.turn_budget_fast_fail",
+                            data: {
+                                stage: "prompt",
+                                reason: "extreme_oversize",
+                                hardBudgetChars: turnBudgetConfig.hardBudgetChars,
+                            },
+                        },
+                        { eventType: "assistant.message", data: { content: refusal } },
+                    ],
+                } as TurnResult);
+            }
 
-            let result = await runTurnWithPrompt(session, finalPrompt);
+            let result = await runTurnWithPrompt(session, boundedPrompt);
+
+            // Model fallback: on a model-layer error, retry once with the next candidate.
+            if (result.type === "error" && isModelFallbackEligibleError((result as any).message)) {
+                const failedModel = runConfig.model;
+                const nextModel = routeDecision.candidates.find((c) => c !== failedModel);
+                if (nextModel) {
+                    activityCtx.traceInfo(
+                        `[runTurn] model.fallback failed=${failedModel ?? "default"} next=${nextModel} error=${(result as any).message}`,
+                    );
+                    await sessionManager.invalidateWarmSession(input.sessionId).catch((err: any) => {
+                        activityCtx.traceInfo(`[runTurn] model.fallback invalidation failed (non-fatal): ${err?.message ?? err}`);
+                    });
+                    runConfig.model = nextModel;
+                    try {
+                        session = await sessionManager.getOrCreate(input.sessionId, runConfig, {
+                            turnIndex: input.turnIndex,
+                            trace,
+                        });
+                        result = await runTurnWithPrompt(session, boundedPrompt);
+                        activityCtx.traceInfo(`[runTurn] model.fallback completed type=${result.type}`);
+                    } catch (fallbackErr: any) {
+                        activityCtx.traceInfo(`[runTurn] model.fallback getOrCreate failed: ${fallbackErr?.message ?? fallbackErr}`);
+                    }
+                    bufferCmsEvent("session.model_fallback", {
+                        failedModel,
+                        fallbackModel: nextModel,
+                        fallbackResultType: result.type,
+                    });
+                }
+            }
 
             if (result.type === "error" && isLiveSessionLostErrorMessage((result as any).message)) {
                 activityCtx.traceInfo(
@@ -1264,7 +1372,7 @@ export function registerActivities(
                 }
 
                 const recoveredPrompt = mergePromptSections([SESSION_RECOVERY_NOTICE, guardedPrompt]) || guardedPrompt;
-                result = await runTurnWithPrompt(session, recoveredPrompt);
+                result = await runTurnWithPrompt(session, budgetPromptForTurn(recoveredPrompt, "recovered_live_session"));
 
                 if (result.type === "error" && isLiveSessionLostErrorMessage((result as any).message)) {
                     const fatalMessage = buildUnrecoverableSessionLossMessage(input.sessionId, (result as any).message);
@@ -1327,7 +1435,7 @@ export function registerActivities(
                 }
 
                 const recoveredPrompt = mergePromptSections([CORRUPTED_TRANSCRIPT_REPLAY_NOTICE, guardedPrompt]) || guardedPrompt;
-                result = await runTurnWithPrompt(session, recoveredPrompt);
+                result = await runTurnWithPrompt(session, budgetPromptForTurn(recoveredPrompt, "corrupted_transcript_replay"));
             }
 
             if (
@@ -1343,6 +1451,28 @@ export function registerActivities(
                     reason: "waiting for parent answer",
                     content: result.content.trim(),
                 } as TurnResult;
+            }
+
+            if (typeof (result as any).content === "string") {
+                const budgetedOutput = applyAssistantOutputBudget((result as any).content, turnBudgetConfig);
+                if (budgetedOutput.trimmed) {
+                    activityCtx.traceInfo(
+                        `[runTurn] assistant output budget hard-hit originalChars=${budgetedOutput.originalChars} ` +
+                        `effectiveChars=${budgetedOutput.effectiveChars}`,
+                    );
+                    if (!input.bootstrap) {
+                        bufferCmsEvent("session.turn_budget", {
+                            stage: "assistant_output",
+                            decision: "hard",
+                            originalChars: budgetedOutput.originalChars,
+                            effectiveChars: budgetedOutput.effectiveChars,
+                        });
+                    }
+                    result = {
+                        ...result,
+                        content: budgetedOutput.text,
+                    } as TurnResult;
+                }
             }
             activityCtx.traceInfo(`[runTurn] ManagedSession.runTurn completed for ${input.sessionId} type=${result.type}`);
 
@@ -2276,7 +2406,7 @@ export function registerActivities(
             input: { cap?: number },
         ): Promise<{ skills: Array<{ key: string; name: string; description: string }>; asks: Array<{ key: string; summary: string }> }> => {
             activityCtx.traceInfo("[loadKnowledgeIndex] loading curated skills and open asks");
-            const cap = input.cap ?? 50;
+            const cap = input.cap ?? 15;
             const { skills, asks } = await loadKnowledgeIndexFromFactStore(factStore, cap);
 
             activityCtx.traceInfo(`[loadKnowledgeIndex] ${skills.length} skills, ${asks.length} asks`);

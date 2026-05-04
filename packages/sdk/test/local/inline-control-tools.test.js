@@ -7,6 +7,7 @@ class FakeCopilotSession {
     catchAllHandlers = [];
     scriptedToolCalls = [];
     scriptedEvents = [];
+    toolResults = [];
     assistantContent = "ok";
     aborted = false;
 
@@ -47,7 +48,8 @@ class FakeCopilotSession {
                 if (this.aborted) break;
                 const tool = this.registeredTools.find((candidate) => candidate.name === call.name);
                 if (!tool) throw new Error(`Missing fake tool: ${call.name}`);
-                await tool.handler(call.args ?? {});
+                const output = await tool.handler(call.args ?? {});
+                this.toolResults.push({ name: call.name, output });
             }
             if (!this.aborted && this.assistantContent != null) {
                 this.emit("assistant.message", { data: { content: this.assistantContent } });
@@ -221,6 +223,39 @@ describe("inline control tool execution", () => {
         expect(result.type).toBe("completed");
         expect(result.content).toBe("Handled the tool failure.");
         expect(fakeSession.aborted).toBe(false);
+    });
+
+    it("trims oversized user tool outputs before they re-enter model context", async () => {
+        const fakeSession = new FakeCopilotSession();
+        const previousCap = process.env.TURN_TOOL_OUTPUT_HARD_BUDGET_CHARS;
+        try {
+            process.env.TURN_TOOL_OUTPUT_HARD_BUDGET_CHARS = "80";
+            fakeSession.scriptedToolCalls = [
+                { name: "regular_tool", args: {} },
+            ];
+            fakeSession.assistantContent = "Tool done.";
+            const onEvent = vi.fn();
+
+            const managed = new ManagedSession("inline-tool-output-cap", fakeSession, {
+                tools: [{
+                    name: "regular_tool",
+                    description: "test tool",
+                    parameters: { type: "object", properties: {} },
+                    handler: async () => "x".repeat(300),
+                }],
+            });
+
+            const result = await managed.runTurn("run large tool output", { onEvent });
+
+            expect(result.type).toBe("completed");
+            expect(fakeSession.toolResults).toHaveLength(1);
+            expect(String(fakeSession.toolResults[0].output)).toContain("Tool output truncated");
+            expect(String(fakeSession.toolResults[0].output).length).toBeLessThanOrEqual(80);
+            expect(onEvent.mock.calls.some(([event]) => event?.eventType === "session.tool_output_truncated")).toBe(true);
+        } finally {
+            if (previousCap == null) delete process.env.TURN_TOOL_OUTPUT_HARD_BUDGET_CHARS;
+            else process.env.TURN_TOOL_OUTPUT_HARD_BUDGET_CHARS = previousCap;
+        }
     });
 
     it("suppresses the benign post-completion null-length query error when the assistant already replied", async () => {

@@ -24,6 +24,7 @@ import type {
 import { createSessionProxy, createSessionManagerProxy } from "./session-proxy.js";
 import { DURABLE_SESSION_LATEST_VERSION } from "./orchestration-version.js";
 import { planWaitHandling } from "./wait-affinity.js";
+import { decideKnowledgeLoad, classifyContextPressure } from "./knowledge-load-policy.js";
 
 /**
  * Set custom status as a JSON blob of session state.
@@ -243,6 +244,7 @@ export function* durableSessionOrchestration_1_0_43(
     const isSystem = input.isSystem ?? false;
     let cronSchedule = input.cronSchedule ? { ...input.cronSchedule } : undefined;
     let contextUsage = cloneContextUsage(input.contextUsage);
+    let lastKnowledgeLoadIteration: number = input.lastKnowledgeLoadIteration ?? -1;
     const MAX_RETRIES = 3;
     const MAX_SUB_AGENTS = 20;
     const MAX_NESTING_LEVEL = 2;
@@ -488,6 +490,7 @@ export function* durableSessionOrchestration_1_0_43(
             nestingLevel,
             ...(isSystem ? { isSystem: true } : {}),
             retryCount: 0,
+            ...(lastKnowledgeLoadIteration >= 0 ? { lastKnowledgeLoadIteration } : {}),
             ...(pendingInputQuestion ? { pendingInputQuestion } : {}),
             ...(waitingForAgentIds ? { waitingForAgentIds } : {}),
             ...(interruptedWaitTimer ? { interruptedWaitTimer } : {}),
@@ -1745,12 +1748,27 @@ export function* durableSessionOrchestration_1_0_43(
             if (needsHydration) return;
         }
 
-        // Load knowledge index
+        // Adaptive knowledge-index loading
         if (config.agentIdentity !== "facts-manager") {
-            try {
-                yield manager.loadKnowledgeIndex();
-            } catch (knErr: any) {
-                ctx.traceInfo(`[orch] loadKnowledgeIndex failed (non-fatal): ${knErr.message || knErr}`);
+            const knDecision = decideKnowledgeLoad({
+                iteration,
+                isBootstrap: promptIsBootstrap,
+                isInternal: prompt === INTERNAL_SYSTEM_TURN_PROMPT,
+                prompt,
+                lastLoadedIteration: lastKnowledgeLoadIteration,
+            });
+            ctx.traceInfo(
+                `[orch] knowledge.load.decision=${knDecision.load ? "load" : "skip"} ` +
+                `turn=${iteration} reason=${knDecision.reason}`,
+            );
+            config.knowledgeIndexSkipLoad = !knDecision.load;
+            if (knDecision.load) {
+                try {
+                    yield manager.loadKnowledgeIndex();
+                    lastKnowledgeLoadIteration = iteration;
+                } catch (knErr: any) {
+                    ctx.traceInfo(`[orch] loadKnowledgeIndex failed (non-fatal): ${knErr.message || knErr}`);
+                }
             }
         }
 
@@ -1901,6 +1919,19 @@ export function* durableSessionOrchestration_1_0_43(
         const result: TurnResult = typeof turnResult === "string" ? JSON.parse(turnResult) : turnResult;
         const observedAt: number = yield ctx.utcNow();
         contextUsage = updateContextUsageFromEvents(contextUsage, (result as any)?.events, observedAt);
+
+        // Preemptive context pressure monitoring — emit early warnings before compaction fires.
+        // Skipped for internal/bootstrap turns to avoid noise on system ticks.
+        if (contextUsage && !promptIsBootstrap) {
+            const pressureLevel = classifyContextPressure(contextUsage.utilization);
+            if (pressureLevel !== "ok") {
+                ctx.traceInfo(
+                    `[orch] context.pressure level=${pressureLevel} ` +
+                    `utilization=${contextUsage.utilization.toFixed(3)} ` +
+                    `tokens=${contextUsage.currentTokens}/${contextUsage.tokenLimit}`,
+                );
+            }
+        }
 
         iteration++;
         yield* maybeSummarize();

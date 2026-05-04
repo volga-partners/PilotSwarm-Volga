@@ -1,6 +1,7 @@
 import { SessionManager } from "./session-manager.js";
 import { SessionBlobStore } from "./blob-store.js";
 import { FilesystemArtifactStore, FilesystemSessionStore, type ArtifactStore, type SessionStateStore } from "./session-store.js";
+import { S3ArtifactStore } from "./s3-artifact-store.js";
 import { registerActivities } from "./session-proxy.js";
 import {
     DURABLE_SESSION_LATEST_VERSION,
@@ -16,6 +17,7 @@ import { createArtifactTools } from "./artifact-tools.js";
 import { createFactStoreForUrl, type FactStore } from "./facts-store.js";
 import { createSweeperTools } from "./sweeper-tools.js";
 import { createResourceManagerTools } from "./resourcemgr-tools.js";
+import { createSloTools } from "./slo-tools.js";
 import { composeSystemPrompt, mergePromptSections } from "./prompt-layering.js";
 import { defineTool } from "@github/copilot-sdk";
 import type { Tool } from "@github/copilot-sdk";
@@ -141,6 +143,12 @@ export class PilotSwarmWorker {
                 effectiveSessionStateDir,
             );
             this.artifactStore = this.blobStore;
+        } else if (options.s3Bucket) {
+            this.artifactStore = new S3ArtifactStore({
+                bucket: options.s3Bucket,
+                region: options.s3Region,
+                keyPrefix: options.s3KeyPrefix,
+            });
         } else {
             // Local mode: use filesystem-based artifact storage
             const artifactDir = path.join(path.dirname(effectiveSessionStateDir), "artifacts");
@@ -177,6 +185,7 @@ export class PilotSwarmWorker {
                 modelProviders: this._modelProviders ?? undefined,
                 turnTimeoutMs: options.turnTimeoutMs,
                 promptGuardrails: options.promptGuardrails,
+                artifactStore: this.artifactStore ?? undefined,
             },
             effectiveSessionStateDir,
         );
@@ -367,6 +376,12 @@ export class PilotSwarmWorker {
                 storeUrl: this.config.store,
             });
             this.registerTools(sweeperTools);
+        }
+
+        // Auto-register SLO monitor tools if CMS is available
+        if (this._catalog) {
+            const sloTools = createSloTools(this._catalog);
+            this.registerTools(sloTools);
         }
 
         // Auto-register artifact tools (blob storage or local filesystem)

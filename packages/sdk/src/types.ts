@@ -1,5 +1,5 @@
 import type { Tool, SessionConfig } from "@github/copilot-sdk";
-import type { SessionStateStore } from "./session-store.js";
+import type { SessionStateStore, ArtifactStore } from "./session-store.js";
 
 export const SESSION_STATE_MISSING_PREFIX = "SESSION_STATE_MISSING:";
 
@@ -108,6 +108,8 @@ export interface TurnOptions {
         cancelAgent(args: { agent_id: string; reason?: string }): Promise<string>;
         deleteAgent(args: { agent_id: string; reason?: string }): Promise<string>;
     };
+    /** Artifact store for auto-offloading large tool outputs. */
+    artifactStore?: ArtifactStore;
 }
 
 // ─── Session Config ──────────────────────────────────────────────
@@ -139,6 +141,12 @@ export interface SerializableSessionConfig {
      * to enforce knowledge pipeline namespace restrictions.
      */
     agentIdentity?: string;
+    /**
+     * @internal Set by the orchestration to skip the knowledge-index DB round-trip
+     * this turn. When true the session-manager uses its cached knowledge blocks.
+     * Cleared to false (or omitted) when the orchestration decides to reload.
+     */
+    knowledgeIndexSkipLoad?: boolean;
 }
 
 /** Full config — includes non-serializable fields (tools, hooks). Stays in memory. */
@@ -284,6 +292,11 @@ export interface OrchestrationInput {
     cronSchedule?: CronSchedule;
     /** Latest known context-window usage snapshot captured from session events. */
     contextUsage?: SessionContextUsage;
+    /**
+     * @internal Orchestration iteration when the knowledge index was last loaded.
+     * -1 signals "never loaded". Carried across continueAsNew.
+     */
+    lastKnowledgeLoadIteration?: number;
 
     // ─── Flat event loop state (v1.0.32+) ───────────────────
     /** Timer state carried across continueAsNew for the flat event loop. */
@@ -419,6 +432,14 @@ export interface PilotSwarmWorkerOptions {
     blobContainer?: string;
     /** Optional session state store. When set, enables durable session dehydration without Azure Blob Storage. */
     sessionStore?: SessionStateStore;
+
+    // ── AWS S3 artifact store ─────────────────────────────────────
+    /** S3 bucket name. When set, artifact auto-offload uses S3 instead of local filesystem. */
+    s3Bucket?: string;
+    /** AWS region for the S3 bucket. Defaults to AWS_REGION env var or "us-east-1". */
+    s3Region?: string;
+    /** Key prefix inside the S3 bucket. Default: "artifacts". */
+    s3KeyPrefix?: string;
 
     /**
      * Turn timeout in milliseconds. If a single LLM turn takes longer than this,

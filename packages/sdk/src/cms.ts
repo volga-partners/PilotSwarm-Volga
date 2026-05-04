@@ -312,6 +312,7 @@ export interface FleetTurnAnalyticsRow {
     toolErrorCount:        number;
     avgDurationMs:         number;
     p95DurationMs:         number;
+    p99DurationMs:         number;
     totalTokensInput:      number;
     totalTokensOutput:     number;
     totalTokensCacheRead:  number;
@@ -1276,6 +1277,7 @@ function rowToFleetTurnAnalyticsRow(row: any): FleetTurnAnalyticsRow {
         toolErrorCount:        Number(row.tool_error_count) || 0,
         avgDurationMs:         Number(row.avg_duration_ms) || 0,
         p95DurationMs:         Number(row.p95_duration_ms) || 0,
+        p99DurationMs:         Number(row.p99_duration_ms) || 0,
         totalTokensInput:      Number(row.total_tokens_input) || 0,
         totalTokensOutput:     Number(row.total_tokens_output) || 0,
         totalTokensCacheRead:  Number(row.total_tokens_cache_read) || 0,

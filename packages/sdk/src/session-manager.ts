@@ -1,6 +1,6 @@
 import { CopilotClient, type CopilotSession, type SectionOverride, type SystemMessageConfig, type Tool } from "@github/copilot-sdk";
 import { ManagedSession } from "./managed-session.js";
-import type { SessionStateStore } from "./session-store.js";
+import type { SessionStateStore, ArtifactStore } from "./session-store.js";
 import { SESSION_STATE_MISSING_PREFIX, type ManagedSessionConfig, type SerializableSessionConfig } from "./types.js";
 import type { ModelProviderRegistry } from "./model-providers.js";
 import { createFactTools } from "./facts-tools.js";
@@ -82,6 +82,14 @@ export interface WorkerDefaults {
     turnTimeoutMs?: number;
     /** Prompt-injection guardrails inherited by all sessions on this worker. */
     promptGuardrails?: import("./types.js").PromptGuardrailConfig;
+    /** Artifact store for auto-offloading large tool outputs (fire-and-forget). */
+    artifactStore?: ArtifactStore;
+    /** Max parallel tool handlers per turn (default: TURN_MAX_CONCURRENT_TOOLS_DEFAULT). */
+    maxConcurrentTools?: number;
+    /** Per-tool hard timeout in ms (default: TOOL_TIMEOUT_MS_DEFAULT). */
+    toolTimeoutMs?: number;
+    /** Char threshold above which tool output is auto-offloaded (default: TOOL_ARTIFACT_OFFLOAD_THRESHOLD_CHARS). */
+    toolArtifactOffloadThresholdChars?: number;
 }
 
 /**
@@ -115,6 +123,10 @@ export class SessionManager {
     private _duroxideClient: any = null;
     /** Lineage lookup for ancestor/descendant facts access. */
     private _getLineageSessionIds: ((sessionId: string) => Promise<string[]>) | null = null;
+    /** Per-session cache of the last rendered knowledge prompt blocks. */
+    private _knowledgeBlockCache = new Map<string, { askBlock?: string; skillBlock?: string; loadedAt: number }>();
+    /** Per-session cache of the last computed last_instructions overlay (for delta skip). */
+    private _lastInstructionsOverlay = new Map<string, string>();
 
     constructor(
         private githubToken?: string,
@@ -135,6 +147,16 @@ export class SessionManager {
     /** Get a human-readable model summary for LLM tool consumption. */
     getModelSummary(): string | undefined {
         return this.workerDefaults.modelProviders?.getModelSummaryForLLM();
+    }
+
+    /** Expose the model provider registry for routing decisions. */
+    getModelRegistry(): import("./model-providers.js").ModelProviderRegistry | undefined {
+        return this.workerDefaults.modelProviders;
+    }
+
+    /** Expose the artifact store for large tool-output offloading. */
+    getArtifactStore(): ArtifactStore | undefined {
+        return this.workerDefaults.artifactStore;
     }
 
     getPromptGuardrails(): import("./types.js").PromptGuardrailConfig | undefined {
@@ -430,6 +452,12 @@ export class SessionManager {
 
         // 1. Check if already in memory (warm) — update config in case
         //    tools were registered after the session was first created.
+        if (turnIndex === 0) {
+            // First turn: invalidate per-session caches so knowledge and
+            // instructions are always freshly computed for a new session run.
+            this._knowledgeBlockCache.delete(sessionId);
+            this._lastInstructionsOverlay.delete(sessionId);
+        }
         const existing = this.sessions.get(sessionId);
         if (existing) {
             if (turnIndex === 0) {
@@ -904,13 +932,33 @@ export class SessionManager {
      * 3. bound agent prompt (for named/system sessions)
      * 4. caller/runtime context
      */
-    private _buildKnowledgeToolInstructionsSection(agentIdentity?: string): SectionOverride | undefined {
+    private _buildKnowledgeToolInstructionsSection(
+        agentIdentity?: string,
+        sessionId?: string,
+    ): SectionOverride | undefined {
         if (!this.factStore || agentIdentity === "facts-manager") return undefined;
 
         return {
             action: async (currentContent: string) => {
+                const latestConfig = sessionId ? this.sessionConfigs.get(sessionId) : undefined;
+                const skipLoad = latestConfig?.knowledgeIndexSkipLoad === true;
+
+                if (skipLoad) {
+                    // Use cached blocks if available; otherwise fall through to load.
+                    const cached = sessionId ? this._knowledgeBlockCache.get(sessionId) : undefined;
+                    if (cached) {
+                        return mergePromptSections([currentContent, cached.askBlock, cached.skillBlock]) ?? currentContent;
+                    }
+                    // No cache yet (e.g. very first turn had an error) — skip and return current.
+                    return currentContent;
+                }
+
+                // Load from the fact-store and refresh the cache.
                 const knowledgeIndex = await loadKnowledgeIndexFromFactStore(this.factStore!, 15);
                 const { askBlock, skillBlock } = buildKnowledgePromptBlocks(knowledgeIndex);
+                if (sessionId) {
+                    this._knowledgeBlockCache.set(sessionId, { askBlock, skillBlock, loadedAt: Date.now() });
+                }
                 return mergePromptSections([currentContent, askBlock, skillBlock]) ?? currentContent;
             },
         };
@@ -932,6 +980,17 @@ export class SessionManager {
                     runtimeContext,
                     latest.turnSystemPrompt,
                 ]);
+
+                // Delta optimization: when the overlay is unchanged and the section
+                // already contains it, skip re-injection to avoid unnecessary updates.
+                const prevOverlay = this._lastInstructionsOverlay.get(sessionId);
+                if (overlay != null && overlay === prevOverlay && currentContent.includes(overlay)) {
+                    return currentContent;
+                }
+                if (overlay != null) {
+                    this._lastInstructionsOverlay.set(sessionId, overlay);
+                }
+
                 return mergePromptSections([currentContent, overlay]) ?? currentContent;
             },
         };
@@ -944,7 +1003,7 @@ export class SessionManager {
         const frameworkBase = this.workerDefaults.frameworkBasePrompt ?? this.workerDefaults.systemMessage;
         const boundAgentName = config.boundAgentName;
         const layerKind = config.promptLayering?.kind ?? (boundAgentName ? "app-agent" : undefined);
-        const knowledgeToolInstructions = this._buildKnowledgeToolInstructionsSection(config.agentIdentity);
+        const knowledgeToolInstructions = this._buildKnowledgeToolInstructionsSection(config.agentIdentity, sessionId);
         const lastInstructions = this._buildLastInstructionsSection(sessionId, config);
         const additionalSections = knowledgeToolInstructions
             ? { tool_instructions: knowledgeToolInstructions, last_instructions: lastInstructions }

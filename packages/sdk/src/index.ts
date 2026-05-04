@@ -110,8 +110,58 @@ export type { ModelEntry, ModelDescriptor, ModelProviderConfig, ModelProvidersFi
 export { composeSystemPrompt, extractPromptContent, mergePromptSections } from "./prompt-layering.js";
 export type { PromptLayeringKind } from "./prompt-layering.js";
 
+// Token Optimization — adaptive knowledge-index load policy
+export {
+    decideKnowledgeLoad,
+    promptNeedsKnowledge,
+    classifyContextPressure,
+    DEFAULT_KNOWLEDGE_REFRESH_INTERVAL,
+} from "./knowledge-load-policy.js";
+export type {
+    KnowledgeLoadDecision,
+    KnowledgeLoadParams,
+    KnowledgeLoadReason,
+    ContextPressureLevel,
+} from "./knowledge-load-policy.js";
+
+// S3 artifact store
+export { S3ArtifactStore } from "./s3-artifact-store.js";
+export type { S3ArtifactStoreOptions } from "./s3-artifact-store.js";
+
+// Tool & Network Controls (Phase 4)
+export {
+    smartTruncate,
+    stringifyForModel,
+    TOOL_ARTIFACT_OFFLOAD_THRESHOLD_CHARS,
+    TOOL_TIMEOUT_MS_DEFAULT,
+    TURN_MAX_CONCURRENT_TOOLS_DEFAULT,
+} from "./turn-budget.js";
+
+// Token Optimization — model routing policy
+export {
+    classifyTurnContext,
+    buildCandidateChain,
+    routeTurn,
+    isModelFallbackEligibleError,
+    MAX_CANDIDATES,
+} from "./model-routing.js";
+export type {
+    TurnCategory,
+    TurnContextParams,
+    RoutingParams,
+    RouteTurnParams,
+    RouteDecision,
+} from "./model-routing.js";
+
 // Debug utilities
 export { SessionDumper } from "./session-dumper.js";
+
+// SLO Measurement & Policy (Phase 5)
+export { DEFAULT_SLO_THRESHOLDS } from "./slo-config.js";
+export type { SloThresholds } from "./slo-config.js";
+export { evaluateSloHealth, decideSloAction } from "./slo-policy.js";
+export type { SloStatus, SloViolation, SloHealthReport, SloAction } from "./slo-policy.js";
+export { createSloTools } from "./slo-tools.js";
 
 // Re-export defineTool from Copilot SDK for convenience
 export { defineTool } from "@github/copilot-sdk";

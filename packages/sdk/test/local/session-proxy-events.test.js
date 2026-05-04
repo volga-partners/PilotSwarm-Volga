@@ -18,6 +18,7 @@ function makeHarness(options = {}) {
     const sessionManager = {
         getOrCreate: vi.fn(async () => session),
         getModelSummary: vi.fn(() => undefined),
+        getModelRegistry: vi.fn(() => undefined),
         getPromptGuardrails: vi.fn(() => ({ enabled: false })),
         invalidateWarmSession: vi.fn(async () => {}),
         resetSessionState: vi.fn(async () => {}),
@@ -628,5 +629,108 @@ describe("session-proxy turn metric insertion", () => {
         );
 
         expect(catalog.insertTurnMetric).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe("session-proxy turn budget enforcement", () => {
+    it("fast-fails extremely oversized prompts without invoking runTurn", async () => {
+        const previousSoft = process.env.TURN_SOFT_BUDGET_CHARS;
+        const previousHard = process.env.TURN_HARD_BUDGET_CHARS;
+        try {
+            process.env.TURN_SOFT_BUDGET_CHARS = "0";
+            process.env.TURN_HARD_BUDGET_CHARS = "100";
+
+            const { runTurn, session, recordedEvents } = makeHarness();
+            session.runTurn = vi.fn(async () => ({ type: "completed", content: "should-not-run", events: [] }));
+
+            const result = await runTurn(
+                { traceInfo: () => {}, isCancelled: () => false },
+                {
+                    sessionId: "budget-fast-fail",
+                    prompt: "A".repeat(400),
+                    config: {},
+                    turnIndex: 1,
+                },
+            );
+
+            expect(result.type).toBe("completed");
+            expect(result.content).toContain("too large to process safely");
+            expect(session.runTurn).not.toHaveBeenCalled();
+            expect(recordedEvents.some((event) => event.eventType === "session.turn_budget_fast_fail")).toBe(true);
+        } finally {
+            if (previousSoft == null) delete process.env.TURN_SOFT_BUDGET_CHARS;
+            else process.env.TURN_SOFT_BUDGET_CHARS = previousSoft;
+            if (previousHard == null) delete process.env.TURN_HARD_BUDGET_CHARS;
+            else process.env.TURN_HARD_BUDGET_CHARS = previousHard;
+        }
+    });
+
+    it("applies hard prompt cap before invoking ManagedSession.runTurn", async () => {
+        const previousSoft = process.env.TURN_SOFT_BUDGET_CHARS;
+        const previousHard = process.env.TURN_HARD_BUDGET_CHARS;
+        try {
+            process.env.TURN_SOFT_BUDGET_CHARS = "0";
+            process.env.TURN_HARD_BUDGET_CHARS = "140";
+
+            const { runTurn, session, recordedEvents } = makeHarness();
+            session.runTurn = vi.fn(async (prompt) => {
+                expect(prompt.length).toBeLessThanOrEqual(140);
+                expect(prompt).toContain("Prompt truncated");
+                return { type: "completed", content: "ok", events: [] };
+            });
+
+            const result = await runTurn(
+                { traceInfo: () => {}, isCancelled: () => false },
+                {
+                    sessionId: "budget-prompt",
+                    prompt: "A".repeat(220),
+                    config: {},
+                    turnIndex: 1,
+                },
+            );
+
+            expect(result.type).toBe("completed");
+            const budgetEvents = recordedEvents.filter((event) => event.eventType === "session.turn_budget");
+            expect(budgetEvents.some((event) =>
+                event.data?.stage === "prompt" && event.data?.decision === "hard",
+            )).toBe(true);
+        } finally {
+            if (previousSoft == null) delete process.env.TURN_SOFT_BUDGET_CHARS;
+            else process.env.TURN_SOFT_BUDGET_CHARS = previousSoft;
+            if (previousHard == null) delete process.env.TURN_HARD_BUDGET_CHARS;
+            else process.env.TURN_HARD_BUDGET_CHARS = previousHard;
+        }
+    });
+
+    it("trims oversized assistant output before returning the turn result", async () => {
+        const previousCap = process.env.TURN_ASSISTANT_OUTPUT_HARD_BUDGET_CHARS;
+        try {
+            process.env.TURN_ASSISTANT_OUTPUT_HARD_BUDGET_CHARS = "110";
+            const { runTurn, session, recordedEvents } = makeHarness();
+            session.runTurn = vi.fn(async () => ({
+                type: "completed",
+                content: "B".repeat(2_000),
+                events: [],
+            }));
+
+            const result = await runTurn(
+                { traceInfo: () => {}, isCancelled: () => false },
+                {
+                    sessionId: "budget-output",
+                    prompt: "hello",
+                    config: {},
+                    turnIndex: 2,
+                },
+            );
+
+            expect(result.type).toBe("completed");
+            expect(result.content.length).toBeLessThanOrEqual(110);
+            expect(result.content).toContain("Response truncated");
+            const budgetEvents = recordedEvents.filter((event) => event.eventType === "session.turn_budget");
+            expect(budgetEvents.some((event) => event.data?.stage === "assistant_output")).toBe(true);
+        } finally {
+            if (previousCap == null) delete process.env.TURN_ASSISTANT_OUTPUT_HARD_BUDGET_CHARS;
+            else process.env.TURN_ASSISTANT_OUTPUT_HARD_BUDGET_CHARS = previousCap;
+        }
     });
 });

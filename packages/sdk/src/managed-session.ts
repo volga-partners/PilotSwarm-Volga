@@ -1,5 +1,6 @@
 import { defineTool, type Tool, type CopilotSession } from "@github/copilot-sdk";
 import type { TurnAction, TurnResult, TurnOptions, ManagedSessionConfig, CapturedEvent } from "./types.js";
+import { buildTurnBudgetConfig, smartTruncate, stringifyForModel } from "./turn-budget.js";
 
 /**
  * Mutable state shared between the wait tool handler and runTurn().
@@ -371,6 +372,7 @@ export class ManagedSession {
             session: this.copilotSession,
             waitThreshold: this.config.waitThreshold ?? 30,
         };
+        const turnBudgetConfig = buildTurnBudgetConfig();
         const controlBridge = opts?.controlToolBridge;
 
         // Build system tools (wait tool + ask_user tool)
@@ -865,8 +867,103 @@ export class ManagedSession {
             deleteAgentTool,
         ];
 
+        // Concurrency semaphore — queues handlers that exceed maxConcurrentTools.
+        let _activeConcurrent = 0;
+        const _concurrentQueue: Array<() => void> = [];
+        const acquireSlot = (): Promise<void> => {
+            if (_activeConcurrent < turnBudgetConfig.maxConcurrentTools) {
+                _activeConcurrent++;
+                return Promise.resolve();
+            }
+            return new Promise(resolve => _concurrentQueue.push(() => { _activeConcurrent++; resolve(); }));
+        };
+        const releaseSlot = (): void => {
+            _activeConcurrent--;
+            _concurrentQueue.shift()?.();
+        };
+
+        const emitTruncationEvent = (toolName: string, originalChars: number, effectiveChars: number): void => {
+            if (opts?.onEvent) {
+                try {
+                    opts.onEvent({
+                        eventType: "session.tool_output_truncated",
+                        data: { toolName, originalChars, effectiveChars },
+                    });
+                } catch {}
+            }
+        };
+
+        const budgetedTools: Tool<any>[] = allTools.map((tool: any) => ({
+            ...tool,
+            handler: async (args: any, invocation: any) => {
+                await acquireSlot();
+                try {
+                    // Per-tool timeout guard
+                    const timeoutMs = turnBudgetConfig.toolTimeoutMs;
+                    const timeoutGuard = new Promise<never>((_, rej) =>
+                        setTimeout(
+                            () => rej(new Error(`[Tool timeout: ${tool.name ?? "unknown"} exceeded ${timeoutMs}ms]`)),
+                            timeoutMs,
+                        )
+                    );
+
+                    let raw: unknown;
+                    try {
+                        raw = await Promise.race([tool.handler(args, invocation), timeoutGuard]);
+                    } catch (toolErr: any) {
+                        raw = toolErr?.message ?? String(toolErr);
+                    }
+
+                    const perToolLimit = turnBudgetConfig.toolOutputBudgetByName?.[tool.name]
+                        ?? turnBudgetConfig.toolOutputHardBudgetChars;
+                    const toolName: string = tool.name ?? "unknown";
+
+                    // Structured results: apply budget to textResultForLlm field only
+                    if (raw && typeof raw === "object") {
+                        const asAny = raw as Record<string, any>;
+                        if (typeof asAny.textResultForLlm === "string") {
+                            const original = asAny.textResultForLlm;
+                            if (original.length > perToolLimit) {
+                                const truncated = smartTruncate(original, perToolLimit, "Tool output");
+                                emitTruncationEvent(toolName, original.length, truncated.length);
+                                return { ...asAny, textResultForLlm: truncated };
+                            }
+                            return raw;
+                        }
+                    }
+
+                    // Stringify for artifact check and truncation
+                    const rawStr = stringifyForModel(raw);
+
+                    // Artifact auto-offload: fire-and-forget, zero added latency
+                    if (
+                        opts?.artifactStore &&
+                        rawStr.length > turnBudgetConfig.toolArtifactOffloadThresholdChars
+                    ) {
+                        const filename = `tool-${toolName}-${Date.now()}.txt`;
+                        opts.artifactStore.uploadArtifact(durableSessionId, filename, rawStr).catch(() => {});
+                        const preview = smartTruncate(rawStr, perToolLimit, "Tool output");
+                        emitTruncationEvent(toolName, rawStr.length, preview.length);
+                        return `${preview}\n\n[Full output saving in background → artifact://${durableSessionId}/${filename}]`;
+                    }
+
+                    // Smart truncation for non-offloaded outputs
+                    if (rawStr.length > perToolLimit) {
+                        const truncated = smartTruncate(rawStr, perToolLimit, "Tool output");
+                        emitTruncationEvent(toolName, rawStr.length, truncated.length);
+                        return truncated;
+                    }
+
+                    // Under budget: return original type if it was a non-string object, else string
+                    return typeof raw === "string" || (raw && typeof raw === "object") ? raw : rawStr;
+                } finally {
+                    releaseSlot();
+                }
+            },
+        }));
+
         // Re-register tools for this turn (may have changed)
-        this.copilotSession.registerTools(allTools);
+        this.copilotSession.registerTools(budgetedTools);
 
         // Collect the final assistant content and all events via on()
         let finalContent: string | undefined;
